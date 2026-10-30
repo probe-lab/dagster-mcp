@@ -29,8 +29,8 @@ Agent: Diagnosing the most recent failure...
          root_cause: "NullPointerError: column 'price' is null"
          suggestions: ["Single step failed — consider re-running from failure"]
 
-Agent: Re-launching the failed job...
-       launch_job("etl_pipeline", "my_project") -> run_id: "run_def456", status: STARTED
+Agent: Re-running only the failed step...
+       reexecute_run("run_abc123") -> run_id: "run_def456", status: QUEUED
 
 Agent: One sensor keeps firing on bad data. Checking its ticks...
        get_tick_history("orders_sensor", "SENSOR") -> 12 consecutive FAILURE ticks
@@ -41,16 +41,16 @@ Agent: Stopping it until the upstream fix lands...
 
 ## What it does
 
-27 tools across 6 categories, designed for autonomous DataOps workflows:
+36 tools across 6 categories, designed for autonomous DataOps workflows:
 
 | Category | Tools | What an agent can do |
 |----------|-------|---------------------|
-| **Runs** | `get_runs` `get_run_status` `get_run_logs` `get_run_stats` `get_run_failure_summary` | Find failures, diagnose root causes, inspect logs and step timing |
-| **Assets** | `search_assets` `resolve_asset_selection` `get_asset_details` `get_recent_materializations` `get_asset_health` | Discover assets, preview lineage selections, check freshness, detect stale data |
+| **Runs** | `get_runs` `get_run_status` `get_run_logs` `get_run_stats` `get_run_failure_summary` `get_compute_logs` | Find failures by status, tag, partition, or time; diagnose root causes with stack traces; read what a step printed to stdout and stderr; inspect logs and step timing |
+| **Assets** | `search_assets` `resolve_asset_selection` `get_asset_details` `get_recent_materializations` `get_asset_health` `get_asset_partition_status` `get_asset_check_results` `get_asset_automation` | Discover assets, preview lineage selections, check health and freshness, find failed partitions and failed checks, see why automation did or did not run an asset |
 | **Jobs** | `list_jobs` | Inventory jobs across code locations, with optional repository/location filters |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
-| **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
-| **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `start_schedule` `stop_schedule` `start_sensor` `stop_sensor` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, start or stop schedules and sensors, reload after deploy |
+| **Instance & backfills** | `get_instance_status` `list_code_locations` `list_backfills` `get_backfill` | Global health check, daemon status, run queue and pools, code location errors, backfill progress and failures |
+| **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `reexecute_run` `terminate_run` `cancel_backfill` `resume_backfill` `retry_backfill` `start_schedule` `stop_schedule` `start_sensor` `stop_sensor` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, re-run failed runs and backfills from failure, stop stuck runs and backfills, start or stop schedules and sensors, reload after deploy |
 
 > Actions are opt-in: set `DAGSTER_READ_ONLY=false` to enable write operations.
 
@@ -224,11 +224,12 @@ Add to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `get_runs` | List recent runs, filter by job name and/or status |
+| `get_runs` | List recent runs. Filter by job, status, run tags (for example `dagster/partition` or `dagster/backfill`), run ids, and creation or update time; page with a cursor |
 | `get_run_status` | Get status, config, tags, and run lineage (re-execution chain via rootRunId/parentRunId) |
 | `get_run_logs` | Get structured log events with pagination and optional level filtering (`ERROR`, `WARNING`, `INFO`); EngineEvent events include `metadataEntries` |
 | `get_run_stats` | Get per-step execution stats: timing, materializations, expectation results |
-| `get_run_failure_summary` | **Consolidated failure diagnosis** — failed steps, root cause error, step durations, and suggestions in one call |
+| `get_run_failure_summary` | **Consolidated failure diagnosis** — failed steps, root cause error, step durations, and suggestions in one call. Each error has its exception class and the last frames of its stack trace. Also gives Dagster's failure reason (for example, the run process stopped) and the last error of each retried step |
+| `get_compute_logs` | What a step printed to stdout and stderr (Dagster's compute logs), such as dbt or Spark output and full tracebacks. For a long log it returns the end, where errors usually are, and the file's storage location |
 
 ### Assets
 
@@ -236,9 +237,12 @@ Add to `claude_desktop_config.json`:
 |------|-------------|
 | `search_assets` | Discover assets by key prefix or group name |
 | `resolve_asset_selection` | Resolve key/group/tag/kind/owner predicates, wildcards, boolean logic, roots/sinks, and lineage traversal into concrete asset keys without launching anything |
-| `get_asset_details` | Get description, upstream/downstream dependencies, partitions, latest materialization |
-| `get_recent_materializations` | Get materialization history with metadata for an asset |
-| `get_asset_health` | **Consolidated health view** — staleness, freshness policy, last run status (works with single asset or entire group) |
+| `get_asset_details` | Get description, kinds, owners, tags, upstream/downstream dependencies, partitions, pools, automation condition, freshness policy, latest materialization |
+| `get_recent_materializations` | Get materialization history for an asset with the partition and metadata of each, optionally for given partitions only |
+| `get_asset_health` | **Consolidated health view** for one asset or a whole group: the status of the latest run (even when an older run materialized the asset), runs in progress, partition counts, check results, freshness policy and status, staleness, and an `issues` list of problems that need attention |
+| `get_asset_partition_status` | Per-partition status of partitioned assets, as on the UI's Partitions tab: counts plus the keys of failed, materializing, materialized, or missing partitions, and the run that failed each failed partition. Failed keys can go straight to `backfill_assets` |
+| `get_asset_check_results` | Latest result (or recent history) of each asset check: passed, failed with ERROR or WARN severity, could not execute, or never run, with the check's metadata |
+| `get_asset_automation` | Why automation did or did not start a run for an asset: the automation condition, the sensors that evaluate it and their last tick, problems such as a stopped sensor, and the latest evaluation as a tree of true and false conditions, with the false conditions that blocked a run |
 
 #### Two-step asset workflow
 
@@ -287,8 +291,7 @@ backfill_assets(
 `resolve_asset_selection` is available in both read-only and read-write modes.
 It returns external, observable, non-executable, and partitioned matches so the
 caller can inspect the complete result. The write tools re-fetch current asset
-definitions before execution. `resolve_asset_selection` and `materialize_assets`
-require Dagster 1.9+.
+definitions before execution.
 
 ### Jobs, Schedules & Sensors
 
@@ -324,13 +327,14 @@ listing as "nothing exists" the way it would misread an empty filtered
 result — use `list_code_locations` or `get_instance_status` to check load
 health directly.
 
-### Instance & Code Locations
+### Instance, Code Locations & Backfills
 
 | Tool | Description |
 |------|-------------|
-| `get_instance_status` | **Start here** — global health: daemon status, queued run count, code location errors |
+| `get_instance_status` | **Start here** — global health: daemon status, queued run count, run queue limit, concurrency pool usage, code location errors |
 | `list_code_locations` | List all code locations and their load status |
-| `list_backfills` | List recent backfills with status and partition progress |
+| `list_backfills` | List recent backfills with their status and error. Filter by status and creation time; page with a cursor |
+| `get_backfill` | One backfill in detail: per-asset counts of targeted, materialized, failed, and in-progress partitions, partition status of job backfills, the error with its stack trace, and the failed runs with their partitions |
 
 ### Write Operations
 
@@ -344,10 +348,14 @@ health directly.
 | `stop_schedule` | Stop (disable) a schedule — persists across restarts; does not terminate in-flight runs |
 | `start_sensor` | Start (enable) a sensor so it resumes evaluating |
 | `stop_sensor` | Stop (disable) a sensor — the fix for a runaway or erroring sensor found via `get_tick_history` |
+| `reexecute_run` | Re-execute a finished run. By default only the failed steps, the steps after them, and steps that never ran; `ALL_STEPS` re-runs everything. The new run keeps the original's tags |
+| `terminate_run` | Stop a stuck or runaway run |
+| `cancel_backfill` | Cancel an in-progress backfill and stop its runs. Refuses a backfill that already finished, because Dagster would mark even that one as canceling |
+| `resume_backfill` | Resume a backfill whose status is `FAILED` (the backfill daemon hit an error). Refuses any other status |
+| `retry_backfill` | Launch a new backfill for what a finished backfill did not materialize, or for all of its partitions |
+| `reload_code_location` | Reload a code location after deploy |
 
 > Schedule/sensor names are unique only within a repository. If the same name exists in several code locations, the start/stop tools refuse to act and list the candidates; pass `repository_name` / `location_name` to disambiguate. Successful calls echo the resolved `repository` and `location`.
-| `terminate_run` | Stop a stuck or runaway run |
-| `reload_code_location` | Reload a code location after deploy |
 
 > Write tools require `DAGSTER_READ_ONLY=false` (default is `true`).
 
@@ -365,14 +373,14 @@ Everything in the "official" column comes from Dagster's own docs at <https://do
 | **Works with Dagster+** | Yes — sends a `Dagster-Cloud-Api-Token` header; extra headers via `DAGSTER_EXTRA_HEADERS` | Yes — this is its only documented target | n/a |
 | **Setup** | Local process launched by your MCP client (Python 3.12+, e.g. `uvx dagster-mcp`), configured with env vars | No local runtime: `claude mcp add --transport http dagster-plus https://mcp.agent.dagster.cloud/mcp --header "Dagster-Cloud-Organization: …" --header "Authorization: Bearer …"` | Copy the skill files into your agent |
 | **Maturity** | v0.8.0 on PyPI (pre-1.0), MIT, single maintainer with occasional outside contributions, "AS IS, WITHOUT WARRANTY OF ANY KIND", no SLA | Labelled by Dagster as Preview: *"under active development, and not considered ready for production use… the APIs may change"*, and published under `/guides/labs/` | Current, no preview label |
-| **Runs** | View, launch, terminate, per-step stats, log retrieval, consolidated failure summary | View ✅, Create/Launch ✅, Delete/Terminate ✅, Insights metrics ✅, Update ❌ (Dagster's matrix); run logs View ✅ | n/a |
-| **Assets** | View, search, health, resolve selection syntax, and **materialize specific assets** (`resolve_asset_selection` → `materialize_assets`, with run config and partition ranges) | View ✅ and Insights metrics ✅; Create/Launch, Update and Delete marked ❌ — i.e. no asset-level materialization tool, though launching a run is supported | n/a |
+| **Runs** | View and filter by tag, partition, or time; launch, re-execute from failure, terminate; per-step stats, event logs and step stdout/stderr, consolidated failure summary with stack traces | View ✅, Create/Launch ✅, Delete/Terminate ✅, Insights metrics ✅, Update ❌ (Dagster's matrix); run logs View ✅ | n/a |
+| **Assets** | View, search, health, per-partition status, asset check results, automation evaluations, resolve selection syntax, and **materialize specific assets** (`resolve_asset_selection` → `materialize_assets`, with run config and partition ranges) | View ✅ and Insights metrics ✅; Create/Launch, Update and Delete marked ❌ — i.e. no asset-level materialization tool, though launching a run is supported | n/a |
 | **Schedules & sensors** | List, tick history, start/stop | Not supported today — confirmed by Dagster, who expect to add it | n/a |
-| **Backfills & partitions** | List backfills, launch partitioned jobs, backfill assets over a partition range | Not listed in Dagster's capability matrix | n/a |
-| **Code locations & instance health** | List/reload code locations, instance status, daemon heartbeats, queued-run counts | Deployments View ✅ and Insights ✅; code locations and daemon health not listed (Dagster+ manages the daemon) | n/a |
+| **Backfills & partitions** | List and inspect backfills (per-asset progress, failed runs), launch partitioned jobs, backfill assets over a partition range, cancel, resume, or retry a backfill from failure | Not listed in Dagster's capability matrix | n/a |
+| **Code locations & instance health** | List/reload code locations, instance status, daemon heartbeats, queued-run counts, run queue limit, concurrency pool usage | Deployments View ✅ and Insights ✅; code locations and daemon health not listed (Dagster+ manages the daemon) | n/a |
 | **Alerting, Insights, Dagster+ Issues** | Not supported — no alerting, cost/Insights metrics, or Issues equivalent | Alert policies and Dagster+ Issues: View / Create / Update / Delete all ✅. Insights metrics ✅ on Runs, Assets and Deployments. All three are documented Dagster+ features (Issues is in limited early access) | n/a |
 | **Multiple instances** | Yes — `DAGSTER_ENVS` maps names to arbitrary URLs and tokens, with a per-tool `env` argument; you can mix OSS and Dagster+ | Deployments within one Dagster+ organization, selected per tool call | n/a |
-| **Write safety** | 17 read tools always registered; the 10 write tools are registered only when `DAGSTER_READ_ONLY=false` (default `true`), so clients cannot even see them otherwise. This is a convenience guardrail, **not** a security boundary: it is a process-level env var read at import, and the API token you configure keeps whatever rights it has | Enforced server-side by Dagster+ token permissions. The docs default to a personal user token; a [service user](https://docs.dagster.io/deployment/dagster-plus/authentication-and-access-control/rbac/users#service-users) is offered as the alternative for scoped, non-human auth (service users are a Dagster+ Pro feature) | n/a |
+| **Write safety** | 22 read tools always registered; the 14 write tools are registered only when `DAGSTER_READ_ONLY=false` (default `true`), so clients cannot even see them otherwise. This is a convenience guardrail, **not** a security boundary: it is a process-level env var read at import, and the API token you configure keeps whatever rights it has | Enforced server-side by Dagster+ token permissions. The docs default to a personal user token; a [service user](https://docs.dagster.io/deployment/dagster-plus/authentication-and-access-control/rbac/users#service-users) is offered as the alternative for scoped, non-human auth (service users are a Dagster+ Pro feature) | n/a |
 | **Support** | Best-effort, community, GitHub issues; no SECURITY.md or documented disclosure process | First-party vendor | First-party vendor |
 
 **Use the official Dagster+ MCP server if** you are on Dagster+ and want alerting, Issues or Insights/cost analysis from an agent, want no local runtime, or need vendor support and a supplier your procurement process will accept.
@@ -383,20 +391,19 @@ For Dagster+ users the two are complementary rather than competing — nothing s
 
 ## Compatibility
 
-The monitoring and existing action tools are tested with Dagster 1.6+.
-`resolve_asset_selection` and `materialize_assets` require Dagster 1.9+ and
-verify the required GraphQL capabilities before querying or launching. The
-`RunsFilter` field name (`jobName` vs `pipelineName`) is auto-detected via schema
-introspection. Configured asset backfills also feature-detect
-`LaunchBackfillParams.runConfigData` and return a clear compatibility error when
-an older schema does not expose it. Schedule and sensor start/stop work on
-Dagster 1.6+: the stop mutations are sent with the `originId`/`selectorId`
-argument pair sourced from `InstigationState.id`/`selectorId`, which modern
-Dagster re-parses as a compound id and older versions accept directly, so no
-version branch is needed. The mutations select error messages via the
-`... on Error` interface fragment rather than per-type fragments, because
-`ScheduleNotFoundError` only joined `ScheduleMutationResult` in Dagster 1.9 and
-spreading it on 1.6-1.8 would fail document validation.
+dagster-mcp needs Dagster 1.13.6 or newer, open-source or Dagster+. CI checks
+every GraphQL document the server sends against the schemas of Dagster 1.13.6
+and 1.13.27. If you run an older Dagster, use dagster-mcp 0.12.3 or earlier.
+
+Two Dagster features are available only on some deployments:
+
+- Dagster+ computes an overall health status for each asset. `get_asset_health`
+  returns it as `dagster_health` when it is present. Open-source Dagster does
+  not compute it, so the tool builds its `issues` list from runs, partitions,
+  checks, and freshness on every deployment.
+- Open-source Dagster does not record "failed to materialize" events. To name
+  the run that failed a partition, `get_asset_partition_status` asks Dagster for
+  the latest run of that partition instead, which works on both.
 
 ## Development
 

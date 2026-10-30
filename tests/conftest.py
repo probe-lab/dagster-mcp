@@ -45,19 +45,6 @@ def env_defaults(monkeypatch):
     monkeypatch.delenv("DAGSTER_API_TOKEN", raising=False)
     monkeypatch.delenv("DAGSTER_EXTRA_HEADERS", raising=False)
     monkeypatch.setenv("DAGSTER_READ_ONLY", "true")
-    # Clear introspection cache between tests
-    _server_mod._runs_filter_job_field.clear()
-    _server_mod._type_fields.clear()
-
-
-@pytest.fixture
-def supported_asset_tool_schema(monkeypatch):
-    """Skip schema introspection in tests focused on post-compatibility behavior."""
-    monkeypatch.setattr(
-        _server_mod,
-        "_dagster_19_compatibility_error",
-        lambda tool_name, required_fields, env=None: None,
-    )
 
 
 @pytest.fixture

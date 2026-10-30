@@ -31,63 +31,65 @@ class TestGetRuns:
         assert len(result) == 1
         assert result[0]["runId"] == "r1"
 
-    def test_with_job_name(self, monkeypatch):
-        mock_post = MagicMock(side_effect=[
-            # 1st call: introspection
-            _mock_response({"data": {"__type": {"inputFields": [
-                {"name": "jobName"}, {"name": "statuses"}, {"name": "runIds"},
-            ]}}}),
-            # 2nd call: actual get_runs query
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-        ])
-        monkeypatch.setattr(httpx, "post", mock_post)
+    def test_with_job_name(self, mock_gql):
+        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
         get_runs(job_name="my_job")
-        query_payload = mock_post.call_args_list[1].kwargs["json"]
-        assert query_payload["variables"]["filter"]["jobName"] == "my_job"
+        mock_post.assert_called_once()
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["filter"] == {"pipelineName": "my_job"}
 
-    def test_with_job_name_pipeline_field(self, monkeypatch):
-        """On older/newer Dagster versions the field is pipelineName."""
-        mock_post = MagicMock(side_effect=[
-            _mock_response({"data": {"__type": {"inputFields": [
-                {"name": "pipelineName"}, {"name": "statuses"},
-            ]}}}),
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-        ])
-        monkeypatch.setattr(httpx, "post", mock_post)
-        get_runs(job_name="my_job")
-        query_payload = mock_post.call_args_list[1].kwargs["json"]
-        assert query_payload["variables"]["filter"]["pipelineName"] == "my_job"
+    def test_tags_run_ids_and_cursor(self, mock_gql):
+        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
+        get_runs(
+            tags={"dagster/partition": "2026-01-03", "team": "data"},
+            run_ids=["r1", "r2"],
+            cursor="r0",
+        )
+        variables = mock_post.call_args.kwargs["json"]["variables"]
+        assert variables["filter"] == {
+            "tags": [
+                {"key": "dagster/partition", "value": "2026-01-03"},
+                {"key": "team", "value": "data"},
+            ],
+            "runIds": ["r1", "r2"],
+        }
+        assert variables["cursor"] == "r0"
 
-    def test_introspection_cached(self, monkeypatch):
-        """Introspection should only happen once per URL."""
-        mock_post = MagicMock(side_effect=[
-            _mock_response({"data": {"__type": {"inputFields": [{"name": "jobName"}]}}}),
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-            # 2nd get_runs call — no introspection, just the query
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-        ])
-        monkeypatch.setattr(httpx, "post", mock_post)
-        get_runs(job_name="a")
-        get_runs(job_name="b")
-        assert mock_post.call_count == 3  # 1 introspection + 2 queries
+    def test_time_filters_accept_iso_strings_and_unix_seconds(self, mock_gql):
+        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
+        get_runs(
+            created_after="2026-01-31T00:00:00Z",
+            # No time zone means UTC.
+            created_before="2026-02-01T00:00:00",
+            updated_after=1767225600,
+        )
+        run_filter = mock_post.call_args.kwargs["json"]["variables"]["filter"]
+        assert run_filter == {
+            "createdAfter": 1769817600.0,
+            "createdBefore": 1769904000.0,
+            "updatedAfter": 1767225600.0,
+        }
 
-    def test_introspection_fallback_on_error(self, monkeypatch):
-        """If introspection fails, fall back to jobName without caching it."""
-        mock_post = MagicMock(side_effect=[
-            Exception("connection refused"),
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-            _mock_response({"data": {"__type": {"inputFields": [
-                {"name": "pipelineName"}, {"name": "statuses"},
-            ]}}}),
-            _mock_response({"data": {"runsOrError": {"results": []}}}),
-        ])
-        monkeypatch.setattr(httpx, "post", mock_post)
-        get_runs(job_name="my_job")
-        get_runs(job_name="my_job")
-        first_query = mock_post.call_args_list[1].kwargs["json"]
-        second_query = mock_post.call_args_list[3].kwargs["json"]
-        assert first_query["variables"]["filter"]["jobName"] == "my_job"
-        assert second_query["variables"]["filter"]["pipelineName"] == "my_job"
+    def test_bad_timestamp_raises_before_any_request(self, mock_gql):
+        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
+        with pytest.raises(ValueError, match="created_after"):
+            get_runs(created_after="yesterday")
+        mock_post.assert_not_called()
+
+    def test_statuses_are_upper_cased(self, mock_gql):
+        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
+        get_runs(statuses=["failure"])
+        assert mock_post.call_args.kwargs["json"]["variables"]["filter"] == {
+            "statuses": ["FAILURE"]
+        }
+
+    def test_invalid_filter_error_raises(self, mock_gql):
+        mock_gql({"data": {"runsOrError": {
+            "__typename": "InvalidPipelineRunsFilterError",
+            "message": "bad filter",
+        }}})
+        with pytest.raises(RuntimeError, match="bad filter"):
+            get_runs()
 
     def test_with_statuses(self, mock_gql):
         mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
@@ -391,6 +393,41 @@ class TestGetRunFailureSummary:
         assert len(result["all_step_durations"]) == 3
         assert any("Multiple steps failed" in s for s in result["suggestions"])
 
+    def test_errors_keep_class_and_the_end_of_the_stack(self, monkeypatch):
+        frames = [f'  File "f{i}.py", line {i}\n' for i in range(12)]
+        responses = [
+            {"data": {"runOrError": {
+                "runId": "r1", "status": "FAILURE", "jobName": "job_a",
+                "stepStats": [{"stepKey": "s", "status": "FAILURE"}],
+            }}},
+            {"data": {"logsForRun": {"hasMore": False, "events": [
+                {"__typename": "ExecutionStepFailureEvent", "stepKey": "s", "error": {
+                    "message": "Error occurred while executing op s",
+                    "className": "DagsterExecutionStepExecutionError",
+                    "stack": [],
+                    "causes": [{
+                        "message": "KeyError: 'price'",
+                        "className": "KeyError",
+                        "stack": frames,
+                    }],
+                }},
+            ]}}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+
+        error = get_run_failure_summary("r1")["failed_steps"][0]["error"]
+
+        assert error == {
+            "message": "Error occurred while executing op s",
+            "className": "DagsterExecutionStepExecutionError",
+            "causes": [{
+                "message": "KeyError: 'price'",
+                "className": "KeyError",
+                "stack": "".join(frames[-8:]),
+                "stack_frames_omitted": 4,
+            }],
+        }
+
     def test_successful_run(self, mock_gql):
         mock_gql({"data": {"runOrError": {
             "runId": "r2", "status": "SUCCESS", "jobName": "j",
@@ -447,3 +484,78 @@ class TestGetRunFailureSummary:
         monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
         result = get_run_failure_summary("r4")
         assert any("retried" in s.lower() for s in result["suggestions"])
+
+    def test_step_error_prefers_the_failure_over_earlier_retries(self, monkeypatch):
+        responses = [
+            {"data": {"runOrError": {
+                "runId": "r4", "status": "FAILURE", "jobName": "j",
+                "tags": [{"key": "dagster/failure_reason", "value": "STEP_FAILURE"}],
+                "stepStats": [{"stepKey": "flaky", "status": "FAILURE"}],
+            }}},
+            {"data": {"logsForRun": {"hasMore": False, "events": [
+                {"__typename": "ExecutionStepUpForRetryEvent", "stepKey": "flaky",
+                 "error": {"message": "timeout", "causes": []}},
+                {"__typename": "ExecutionStepFailureEvent", "stepKey": "flaky",
+                 "error": {"message": "timeout again", "causes": []}},
+                # A run that failed because steps failed has no run-level error.
+                {"__typename": "RunFailureEvent", "error": None},
+            ]}}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+        result = get_run_failure_summary("r4")
+        assert result["failure_reason"] == "STEP_FAILURE"
+        assert result["failed_steps"][0]["error"] == {"message": "timeout again"}
+        assert result["root_cause_error"] == {"message": "timeout again"}
+        assert result["retried_steps"] == [{"step_key": "flaky", "retries": 1}]
+
+    def test_interrupted_run_with_a_retried_step(self, monkeypatch):
+        retry_error = {"message": "RetryRequestedFromPolicy", "className": "RetryRequestedFromPolicy",
+                       "causes": [{"message": "OSError: checksum mismatch", "className": "OSError"}]}
+        responses = [
+            {"data": {"runOrError": {
+                "runId": "r5", "status": "FAILURE", "jobName": "j",
+                "tags": [{"key": "dagster/failure_reason", "value": "UNEXPECTED_TERMINATION"}],
+                "stepStats": [{"stepKey": "upload", "status": "IN_PROGRESS"}],
+            }}},
+            {"data": {"logsForRun": {"hasMore": True, "cursor": "c1", "events": [
+                {"__typename": "ExecutionStepUpForRetryEvent", "stepKey": "upload",
+                 "error": {"message": "first", "causes": []}},
+            ]}}},
+            {"data": {"logsForRun": {"hasMore": False, "cursor": "c2", "events": [
+                {"__typename": "ExecutionStepUpForRetryEvent", "stepKey": "upload",
+                 "error": retry_error},
+                {"__typename": "RunFailureEvent", "error": {
+                    "message": "DagsterExecutionInterruptedError",
+                    "className": "DagsterExecutionInterruptedError", "causes": []}},
+            ]}}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+        result = get_run_failure_summary("r5")
+        assert result["failure_reason"] == "UNEXPECTED_TERMINATION"
+        assert result["failed_steps"] == []
+        assert result["root_cause_error"]["className"] == "DagsterExecutionInterruptedError"
+        assert result["retried_steps"] == [{
+            "step_key": "upload", "retries": 2,
+            "last_error": {"message": "RetryRequestedFromPolicy",
+                           "className": "RetryRequestedFromPolicy",
+                           "causes": [{"message": "OSError: checksum mismatch",
+                                       "className": "OSError"}]},
+        }]
+        assert any("still running when the run failed: upload" in s for s in result["suggestions"])
+
+    def test_events_are_read_past_the_first_pages(self, monkeypatch):
+        from dagster_mcp import server
+
+        monkeypatch.setattr(server, "_FAILURE_EVENTS_MAX_PAGES", 3)
+        page = {"data": {"logsForRun": {"hasMore": True, "cursor": "c",
+                                        "events": [{"__typename": "LogMessageEvent"}] * 2}}}
+        responses = [
+            {"data": {"runOrError": {"runId": "r6", "status": "FAILURE", "jobName": "j",
+                                     "stepStats": []}}},
+            page, page, page,
+        ]
+        mock_post = _make_mock_post(responses)
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = get_run_failure_summary("r6")
+        assert result["root_cause_error"] is None
+        assert any("Only the first 6 events" in s for s in result["suggestions"])

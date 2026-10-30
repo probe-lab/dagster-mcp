@@ -30,15 +30,6 @@ from tests.graphql_schema import AVAILABLE, schema_errors
 
 _OPERATION = re.compile(r"\b(?:query|mutation)\s+([A-Z][A-Za-z0-9_]*)\s*[({]")
 
-# Tools that refuse to run below Dagster 1.9 via _dagster_19_compatibility_error.
-# Their documents are only valid against a 1.9+ schema, by design.
-_REQUIRES_19 = {
-    "AssetSelectionGraph",
-    "MaterializationAssetNodes",
-    "MaterializationRequirements",
-    "MaterializeAssets",
-}
-
 _REPO = {"name": "repo", "location": {"name": "loc"}}
 _ASSET_NODE = {
     "assetKey": {"path": ["a"]},
@@ -88,14 +79,61 @@ _RESPONSES = {
     "AssetDetails": {"assetNodes": []},
     "AllAssets": {"assetNodes": [_ASSET_NODE]},
     "AssetSelectionGraph": {"assetNodes": [_ASSET_NODE]},
-    # A materialization with a runId is what makes get_asset_health look up run
-    # statuses, which is the only path that sends RunStatuses.
-    "AssetHealth": {
+    "AssetHealth": {"assetNodes": [_ASSET_NODE]},
+    "AssetPartitionStatus": {
         "assetNodes": [
-            dict(_ASSET_NODE, assetMaterializations=[{"runId": "r", "timestamp": "1"}])
+            {
+                "assetKey": {"path": ["a"]},
+                "isPartitioned": True,
+                "partitionKeysByDimension": [{"name": "default", "partitionKeys": ["p1"]}],
+                "assetPartitionStatuses": {
+                    "__typename": "DefaultPartitionStatuses",
+                    "failedPartitions": ["p1"],
+                },
+            }
         ]
     },
-    "RunStatuses": {"runsOrError": {"results": []}},
+    "AssetChecks": {
+        "assetNodes": [
+            dict(
+                _ASSET_NODE,
+                assetChecksOrError={"__typename": "AssetChecks", "checks": [{"name": "c"}]},
+            )
+        ]
+    },
+    "Backfill": {"partitionBackfillOrError": {"__typename": "PartitionBackfill", "id": "b"}},
+    # The backfill id picks the status, so cancel, resume, and retry all reach
+    # their mutation.
+    "BackfillStatus": lambda variables: {
+        "partitionBackfillOrError": {
+            "__typename": "PartitionBackfill",
+            "status": {"failed": "FAILED", "running": "REQUESTED"}.get(
+                variables["backfillId"], "COMPLETED_FAILED"
+            ),
+        }
+    },
+    "RunStatusForReexecution": {"runOrError": {"__typename": "Run", "status": "FAILURE"}},
+    "CapturedLogEvents": {
+        "logsForRun": {
+            "__typename": "EventConnection",
+            "hasMore": False,
+            "events": [{"__typename": "LogsCapturedEvent", "fileKey": "f", "stepKeys": ["s"]}],
+        }
+    },
+    # A full first read makes the tool probe for the end of the log.
+    "CapturedLogs": {"r0": {"stdout": "x", "stderr": None, "cursor": "10000:0"}, "meta": {}},
+    "AssetAutomation": {
+        "assetNodeOrError": {
+            "__typename": "AssetNode",
+            "automationCondition": {"label": "eager", "expandedLabel": []},
+            "targetingInstigators": [],
+        },
+        "assetConditionEvaluationRecordsOrError": {
+            "__typename": "AssetConditionEvaluationRecords",
+            "records": [],
+        },
+        "instance": {},
+    },
     "ListJobs": {"repositoriesOrError": {"__typename": "RepositoryConnection", "nodes": []}},
     "ListJobRepositories": {
         "repositoriesOrError": {"__typename": "RepositoryConnection", "nodes": [_REPO]},
@@ -132,7 +170,7 @@ _RESPONSES = {
     "TickHistory": {"instigationStateOrError": {"__typename": "InstigationState", "ticks": []}},
     "InstanceStatus": {
         "instance": {"daemonHealth": {"allDaemonStatuses": []}},
-        "runsOrError": {"results": []},
+        "runsOrError": {"count": 0},
         "workspaceOrError": _WORKSPACE,
     },
     "CodeLocations": {"workspaceOrError": _WORKSPACE},
@@ -146,19 +184,6 @@ _RESPONSES = {
 }
 
 
-def _type_fields_response(variables):
-    # Answer introspection permissively so feature-gated paths take the branch
-    # that sends their document.
-    names = {"jobName", "runConfigData"}
-    for fields in (
-        *server._RESOLVE_ASSET_SELECTION_SCHEMA.values(),
-        *server._MATERIALIZE_ASSETS_SCHEMA.values(),
-    ):
-        names |= fields
-    entries = [{"name": name} for name in sorted(names)]
-    return {"__type": {"fields": entries, "inputFields": entries}}
-
-
 def _operation_name(document: str) -> str:
     match = _OPERATION.search(document)
     assert match, f"GraphQL document without a named operation:\n{document}"
@@ -169,24 +194,36 @@ def _drive_every_tool(captured: dict[str, set[str]]) -> None:
     def fake_gql(query, variables=None, env=None):
         name = _operation_name(query)
         captured.setdefault(name, set()).add(query)
-        if name == "TypeFields":
-            return _type_fields_response(variables)
-        return _RESPONSES.get(name, {})
+        response = _RESPONSES.get(name, {})
+        return response(variables) if callable(response) else response
 
     calls = [
         lambda: server.get_runs(),
-        lambda: server.get_runs(job_name="j", statuses=["FAILURE"]),
+        lambda: server.get_runs(
+            job_name="j",
+            statuses=["FAILURE"],
+            tags={"dagster/partition": "p1"},
+            run_ids=["r"],
+            created_after="2026-01-01T00:00:00Z",
+            created_before=1767225600,
+            updated_after="2026-01-01",
+            cursor="r",
+        ),
         lambda: server.get_run_status("r"),
         lambda: server.get_run_logs("r", level_filter="WARNING"),
         lambda: server.get_run_stats("r"),
         lambda: server.get_run_failure_summary("r"),
+        lambda: server.get_compute_logs("r", step_key="s"),
         lambda: server.search_assets(prefix="a"),
         lambda: server.search_assets(group="g"),
         lambda: server.resolve_asset_selection("a+"),
         lambda: server.get_asset_details(["a"]),
-        lambda: server.get_recent_materializations("a"),
+        lambda: server.get_recent_materializations("a", partitions=["p1"]),
+        lambda: server.get_asset_check_results(["a"]),
+        lambda: server.get_asset_automation("a"),
         lambda: server.get_asset_health("a"),
         lambda: server.get_asset_health("g"),
+        lambda: server.get_asset_partition_status(["a"]),
         lambda: server.list_jobs(),
         lambda: server.list_jobs(repository_name="repo"),
         lambda: server.list_jobs(repository_name="repo", location_name="loc"),
@@ -196,7 +233,12 @@ def _drive_every_tool(captured: dict[str, set[str]]) -> None:
         lambda: server.get_tick_history("s", "SENSOR"),
         lambda: server.get_instance_status(),
         lambda: server.list_code_locations(),
-        lambda: server.list_backfills(),
+        lambda: server.list_backfills(statuses=["FAILED"], created_after=0, cursor="b"),
+        lambda: server.get_backfill("b"),
+        lambda: server.cancel_backfill("running"),
+        lambda: server.resume_backfill("failed"),
+        lambda: server.retry_backfill("b"),
+        lambda: server.reexecute_run("r", tags={"t": "v"}),
         lambda: server.materialize_assets(["a"], run_config={}, tags={"t": "v"}),
         lambda: server.backfill_assets(["a"], partition_start="p1", partition_end="p2"),
         lambda: server.backfill_assets(["a"], partition_keys=["p1"], run_config={}),
@@ -213,8 +255,6 @@ def _drive_every_tool(captured: dict[str, set[str]]) -> None:
 
     original = server.gql
     server.gql = fake_gql
-    server._runs_filter_job_field.clear()
-    server._type_fields.clear()
     try:
         for call in calls:
             # Only the documents sent matter here, not whether the tool succeeds.
@@ -222,8 +262,6 @@ def _drive_every_tool(captured: dict[str, set[str]]) -> None:
                 call()
     finally:
         server.gql = original
-        server._runs_filter_job_field.clear()
-        server._type_fields.clear()
 
 
 @functools.cache
@@ -251,11 +289,8 @@ def test_every_operation_in_source_is_exercised():
     reason="dagster-graphql is not installed; CI runs this with uv run --with",
 )
 def test_every_sent_document_validates_against_the_schema():
-    version = tuple(int(part) for part in metadata.version("dagster-graphql").split(".")[:2])
     failures = []
     for name, documents in sorted(_captured().items()):
-        if version < (1, 9) and name in _REQUIRES_19:
-            continue
         for document in documents:
             errors = schema_errors(document)
             if errors:

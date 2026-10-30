@@ -1,7 +1,3 @@
-import json
-from unittest.mock import MagicMock
-
-import httpx
 import pytest
 
 from dagster_mcp import server as server_module
@@ -248,7 +244,6 @@ class TestAssetSelectionParser:
             resolve_asset_selection_nodes(asset_nodes, "group:")
 
 
-@pytest.mark.usefixtures("supported_asset_tool_schema")
 class TestResolveAssetSelectionTool:
     def test_returns_keys_and_summaries_without_filtering(self, mock_gql, asset_nodes):
         mock_post = mock_gql({"data": {"assetNodes": asset_nodes}})
@@ -287,100 +282,3 @@ class TestResolveAssetSelectionTool:
         assert result["asset_keys"] == []
         assert result["assets"] == []
         assert "Failed to evaluate selection" in result["message"]
-
-
-def _mock_response(data):
-    response = MagicMock()
-    response.status_code = 200
-    response.json.return_value = data
-    response.text = json.dumps(data)
-    return response
-
-
-class TestResolveAssetSelectionCompatibility:
-    def test_reports_unsupported_schema_without_fetching_asset_graph(
-        self,
-        monkeypatch,
-    ):
-        query_fields = server_module._RESOLVE_ASSET_SELECTION_SCHEMA["Query"]
-        asset_fields = server_module._RESOLVE_ASSET_SELECTION_SCHEMA["AssetNode"] - {
-            "kinds"
-        }
-        mock_post = MagicMock(
-            side_effect=[
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [{"name": name} for name in query_fields]
-                            }
-                        }
-                    }
-                ),
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [{"name": name} for name in asset_fields]
-                            }
-                        }
-                    }
-                ),
-            ]
-        )
-        monkeypatch.setattr(httpx, "post", mock_post)
-
-        result = resolve_asset_selection("group:analytics")
-
-        assert "requires Dagster 1.9+" in result["message"]
-        assert "AssetNode.kinds" in result["message"]
-        assert mock_post.call_count == 2
-        assert all(
-            "TypeFields" in call.kwargs["json"]["query"]
-            for call in mock_post.call_args_list
-        )
-
-    def test_compatible_schema_proceeds_to_asset_graph(self, monkeypatch, asset_nodes):
-        mock_post = MagicMock(
-            side_effect=[
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [
-                                    {"name": name}
-                                    for name in server_module._RESOLVE_ASSET_SELECTION_SCHEMA[
-                                        "Query"
-                                    ]
-                                ]
-                            }
-                        }
-                    }
-                ),
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [
-                                    {"name": name}
-                                    for name in server_module._RESOLVE_ASSET_SELECTION_SCHEMA[
-                                        "AssetNode"
-                                    ]
-                                ]
-                            }
-                        }
-                    }
-                ),
-                _mock_response({"data": {"assetNodes": asset_nodes}}),
-            ]
-        )
-        monkeypatch.setattr(httpx, "post", mock_post)
-
-        result = resolve_asset_selection("group:analytics")
-
-        assert result["asset_keys"] == [
-            "warehouse/clean_orders",
-            "warehouse/external_orders",
-            "warehouse/order_report",
-        ]
-        assert mock_post.call_count == 3

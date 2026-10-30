@@ -1,6 +1,6 @@
 import pytest
 
-from dagster_mcp.server import get_instance_status, list_backfills, list_code_locations
+from dagster_mcp.server import get_instance_status, list_code_locations
 
 
 class TestListCodeLocations:
@@ -39,36 +39,14 @@ class TestListCodeLocations:
             list_code_locations()
 
 
-class TestListBackfills:
-    def test_backfills(self, mock_gql):
-        mock_gql({"data": {"partitionBackfillsOrError": {"results": [
-            {"backfillId": "bf1", "status": "COMPLETED",
-             "numPartitions": 10, "timestamp": "1000",
-             "partitionNames": ["p1", "p2"],
-             "partitionSetName": "my_set"},
-        ]}}})
-        result = list_backfills()
-        assert len(result) == 1
-        assert result[0]["backfillId"] == "bf1"
-
-    def test_empty(self, mock_gql):
-        mock_gql({"data": {"partitionBackfillsOrError": {"results": []}}})
-        assert list_backfills() == []
-
-    def test_custom_limit(self, mock_gql):
-        mock_post = mock_gql({"data": {"partitionBackfillsOrError": {"results": []}}})
-        list_backfills(limit=5)
-        payload = mock_post.call_args.kwargs["json"]
-        assert payload["variables"]["limit"] == 5
-
-
-def _instance_response(daemons=None, queued_runs=None, locations=None, queued_count=None):
-    runs = {"results": queued_runs or []}
-    if queued_count is not None:
-        runs["count"] = queued_count
+def _instance_response(daemons=None, locations=None, queued_count=0, pools=None, max_runs=None):
     return {"data": {
-        "instance": {"daemonHealth": {"allDaemonStatuses": daemons or []}},
-        "runsOrError": runs,
+        "instance": {
+            "daemonHealth": {"allDaemonStatuses": daemons or []},
+            "runQueueConfig": {"maxConcurrentRuns": max_runs} if max_runs is not None else None,
+            "concurrencyLimits": pools or [],
+        },
+        "runsOrError": {"count": queued_count},
         "workspaceOrError": {"locationEntries": locations or []},
     }}
 
@@ -92,36 +70,39 @@ class TestGetInstanceStatus:
         assert len(result["daemons"]) == 2
         assert result["queued_runs_count"] == 0
         assert result["code_location_errors"] == []
+        assert result["pools"] == []
+        assert result["max_concurrent_runs"] is None
 
-    def test_queued_count_uses_server_total(self, mock_gql):
-        # The QUEUED probe is paged at 100. Reporting len(results) means any
-        # backlog >= 100 reads as exactly 100 — saturating precisely when the
-        # number matters. Runs.count is the real total for the filter.
-        mock_gql(_instance_response(
-            queued_runs=[{"runId": f"r{i}"} for i in range(100)],
-            queued_count=4237,
-        ))
+    def test_queued_count_is_the_server_total(self, mock_gql):
+        mock_post = mock_gql(_instance_response(queued_count=4237))
         result = get_instance_status()
         assert result["queued_runs_count"] == 4237
-        assert result["queued_runs_count_capped"] is False
+        # Only the total is needed, so no run rows are fetched.
+        assert "results" not in mock_post.call_args.kwargs["json"]["query"]
 
-    def test_queued_count_falls_back_and_flags_cap(self, mock_gql):
-        # Older Dagster leaves Runs.count nullable; fall back to the page
-        # length but say it is a floor rather than passing 100 off as exact.
+    def test_queued_count_error_raises(self, mock_gql):
+        response = _instance_response()
+        response["data"]["runsOrError"] = {"message": "storage is down"}
+        mock_gql(response)
+        with pytest.raises(RuntimeError, match="storage is down"):
+            get_instance_status()
+
+    def test_pools_and_run_queue_limit(self, mock_gql):
         mock_gql(_instance_response(
-            queued_runs=[{"runId": f"r{i}"} for i in range(100)],
+            max_runs=10,
+            pools=[{"concurrencyKey": "warehouse", "slotCount": 2,
+                    "activeSlotCount": 2, "pendingStepCount": 7}],
         ))
         result = get_instance_status()
-        assert result["queued_runs_count"] == 100
-        assert result["queued_runs_count_capped"] is True
+        assert result["max_concurrent_runs"] == 10
+        assert result["pools"] == [
+            {"pool": "warehouse", "limit": 2, "in_use": 2, "waiting_steps": 7}
+        ]
 
-    def test_queued_count_below_page_limit_is_not_capped(self, mock_gql):
-        mock_gql(_instance_response(
-            queued_runs=[{"runId": "r1"}, {"runId": "r2"}],
-        ))
-        result = get_instance_status()
-        assert result["queued_runs_count"] == 2
-        assert result["queued_runs_count_capped"] is False
+    def test_unlimited_run_queue_is_reported_as_null(self, mock_gql):
+        # Dagster stores "no limit" as -1.
+        mock_gql(_instance_response(max_runs=-1))
+        assert get_instance_status()["max_concurrent_runs"] is None
 
     def test_unhealthy_daemon(self, mock_gql):
         mock_gql(_instance_response(
@@ -150,13 +131,13 @@ class TestGetInstanceStatus:
         assert len(result["code_location_errors"]) == 1
         assert result["code_location_errors"][0]["name"] == "broken_loc"
 
-    def test_queued_runs(self, mock_gql):
+    def test_queued_runs_do_not_make_the_instance_unhealthy(self, mock_gql):
         mock_gql(_instance_response(
             daemons=[
                 {"daemonType": "SCHEDULER", "required": True,
                  "healthy": True, "lastHeartbeatTime": "1000"},
             ],
-            queued_runs=[{"runId": "r1"}, {"runId": "r2"}, {"runId": "r3"}],
+            queued_count=3,
         ))
         result = get_instance_status()
         assert result["queued_runs_count"] == 3
