@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from dagster_mcp import server as server_module
 from dagster_mcp.server import (
     backfill_assets,
     get_tick_history,
@@ -105,7 +104,6 @@ class TestReloadCodeLocation:
         assert "message" in result
 
 
-@pytest.mark.usefixtures("supported_asset_tool_schema")
 class TestMaterializeAssets:
     def test_success_uses_asset_selection_config_tags_and_checks(self, monkeypatch):
         node = _materializable_node(
@@ -456,79 +454,6 @@ class TestMaterializeAssets:
         assert "concrete slash-delimited asset keys" in result["message"]
 
 
-class TestAssetToolCompatibility:
-    def test_materializer_reports_unsupported_schema_without_preflight(
-        self,
-        monkeypatch,
-    ):
-        query_fields = server_module._MATERIALIZE_ASSETS_SCHEMA["Query"] - {
-            "assetNodeAdditionalRequiredKeys"
-        }
-        asset_fields = server_module._MATERIALIZE_ASSETS_SCHEMA["AssetNode"]
-        mock_post = MagicMock(
-            side_effect=[
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [{"name": name} for name in query_fields]
-                            }
-                        }
-                    }
-                ),
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [{"name": name} for name in asset_fields]
-                            }
-                        }
-                    }
-                ),
-            ]
-        )
-        monkeypatch.setattr(httpx, "post", mock_post)
-
-        result = materialize_assets(["asset_a"])
-
-        assert "requires Dagster 1.9+" in result["message"]
-        assert "Query.assetNodeAdditionalRequiredKeys" in result["message"]
-        assert mock_post.call_count == 2
-        assert all(
-            "TypeFields" in call.kwargs["json"]["query"]
-            for call in mock_post.call_args_list
-        )
-
-    def test_invalid_introspection_responses_are_not_cached(self, monkeypatch):
-        mock_post = MagicMock(
-            side_effect=[
-                httpx.TimeoutException("temporary timeout"),
-                _mock_response({"data": {"__type": None}}),
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "fields": [{"name": "assetNodes"}],
-                            }
-                        }
-                    }
-                ),
-            ]
-        )
-        monkeypatch.setattr(httpx, "post", mock_post)
-
-        with pytest.raises(RuntimeError, match="timed out"):
-            server_module._get_type_fields("Query")
-
-        assert not server_module._type_fields
-        with pytest.raises(RuntimeError, match="invalid GraphQL introspection"):
-            server_module._get_type_fields("Query")
-
-        assert not server_module._type_fields
-        assert server_module._get_type_fields("Query") == frozenset({"assetNodes"})
-        assert mock_post.call_count == 3
-
-
 class TestLaunchJob:
     def test_launch_simple(self, mock_gql):
         mock_gql({"data": {"launchRun": {
@@ -729,66 +654,25 @@ class TestLaunchJobWithPartitions:
 
 
 class TestBackfillAssets:
-    def test_run_config_is_forwarded_when_supported(self, monkeypatch):
-        mock_post = MagicMock(
-            side_effect=[
-                _mock_response(
-                    {
-                        "data": {
-                            "__type": {
-                                "inputFields": [
-                                    {"name": "assetSelection"},
-                                    {"name": "runConfigData"},
-                                ]
-                            }
-                        }
-                    }
-                ),
-                _mock_response(
-                    {
-                        "data": {
-                            "launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "configured"}
-                        }
-                    }
-                ),
-            ]
-        )
-        monkeypatch.setattr(httpx, "post", mock_post)
-        config = {"ops": {"benchmark": {"config": {"limit": 10}}}}
-
-        result = backfill_assets(
-            ["asset_a"],
-            partition_keys=["p1"],
-            run_config=config,
-        )
-
-        assert result["backfillId"] == "configured"
-        launch_payload = mock_post.call_args_list[1].kwargs["json"]
-        assert launch_payload["variables"]["backfillParams"]["runConfigData"] == config
-
-    def test_run_config_reports_unsupported_schema(self, monkeypatch):
-        mock_post = MagicMock(
-            return_value=_mock_response(
-                {
-                    "data": {
-                        "__type": {
-                            "inputFields": [{"name": "assetSelection"}]
-                        }
+    def test_run_config_is_forwarded(self, mock_gql):
+        mock_post = mock_gql(
+            {
+                "data": {
+                    "launchPartitionBackfill": {
+                        "__typename": "LaunchBackfillSuccess",
+                        "backfillId": "configured",
                     }
                 }
-            )
+            }
         )
-        monkeypatch.setattr(httpx, "post", mock_post)
+        config = {"ops": {"benchmark": {"config": {"limit": 10}}}}
 
-        result = backfill_assets(
-            ["asset_a"],
-            partition_keys=["p1"],
-            run_config={"ops": {}},
-        )
+        result = backfill_assets(["asset_a"], partition_keys=["p1"], run_config=config)
 
-        assert "does not expose" in result["message"]
-        assert "runConfigData" in result["message"]
-        assert mock_post.call_count == 1
+        assert result["backfillId"] == "configured"
+        mock_post.assert_called_once()
+        launch_payload = mock_post.call_args.kwargs["json"]
+        assert launch_payload["variables"]["backfillParams"]["runConfigData"] == config
 
     def test_explicit_partition_keys_skip_resolution(self, mock_gql):
         mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}})

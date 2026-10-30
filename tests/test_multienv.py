@@ -172,7 +172,7 @@ class TestToolsWithEnvParam:
         monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
         mock_post = self._mock_post(monkeypatch, {
             "instance": {"daemonHealth": {"allDaemonStatuses": []}},
-            "runsOrError": {"results": []},
+            "runsOrError": {"count": 0},
             "workspaceOrError": {"locationEntries": []},
         })
 

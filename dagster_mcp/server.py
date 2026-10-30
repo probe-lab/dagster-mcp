@@ -4,6 +4,7 @@ import bisect
 import json
 import os
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any, Final, TypedDict
 from urllib.parse import urljoin, urlparse
 
@@ -51,10 +52,11 @@ _env_info = (
 mcp = FastMCP(
     "dagster",
     instructions=(
-        f"Use these tools to monitor and operate a running Dagster instance ({_mode} mode). "
+        f"Use these tools to monitor and operate a running Dagster 1.13.6+ instance ({_mode} mode). "
         f"{_env_info}"
-        "Start with list_jobs or get_runs to explore what is available, then "
-        "drill into specific runs, assets, schedules, or sensors as needed."
+        "Start with get_instance_status, get_runs, or get_asset_health to find problems, then "
+        "drill into specific runs and their step logs, assets, partitions, automation, "
+        "backfills, schedules, or sensors."
     ),
 )
 
@@ -127,130 +129,6 @@ def _build_headers(
 
         headers.update(extra_headers)
     return headers
-
-
-# ---------------------------------------------------------------------------
-# RunsFilter introspection — detect whether the instance uses "jobName" or
-# "pipelineName" as the filter field (varies across Dagster versions).
-# ---------------------------------------------------------------------------
-
-_runs_filter_job_field: dict[str, str] = {}  # graphql_url -> field name
-_type_fields: dict[tuple[str, str, str], frozenset[str]] = {}
-
-
-def _get_runs_filter_job_field(env: str | None = None) -> str:
-    """Return the correct RunsFilter field name for job filtering."""
-    graphql_url, _, _ = _resolve_connection(env)
-
-    if graphql_url in _runs_filter_job_field:
-        return _runs_filter_job_field[graphql_url]
-
-    try:
-        fields = _get_type_fields("RunsFilter", env=env, input_type=True)
-    except Exception:  # noqa: BLE001 - any introspection failure means "fall back"
-        # Job filtering predates introspection support and historically used
-        # jobName, so preserve that fallback without caching a transient failure.
-        return "jobName"
-
-    field = "pipelineName" if "pipelineName" in fields and "jobName" not in fields else "jobName"
-    _runs_filter_job_field[graphql_url] = field
-    return field
-
-
-def _get_type_fields(
-    type_name: str,
-    env: str | None = None,
-    *,
-    input_type: bool = False,
-) -> frozenset[str]:
-    """Return GraphQL fields for a type, caching only valid introspection results."""
-    graphql_url, _, _ = _resolve_connection(env)
-    field_kind = "inputFields" if input_type else "fields"
-    cache_key = (graphql_url, type_name, field_kind)
-    if cache_key in _type_fields:
-        return _type_fields[cache_key]
-
-    query = """
-    query TypeFields($typeName: String!) {
-      __type(name: $typeName) {
-        fields { name }
-        inputFields { name }
-      }
-    }
-    """
-    data = gql(query, {"typeName": type_name}, env=env)
-    type_info = data.get("__type")
-    field_entries = type_info.get(field_kind) if isinstance(type_info, dict) else None
-    if not isinstance(field_entries, list) or any(
-        not isinstance(field, dict) or not isinstance(field.get("name"), str)
-        for field in field_entries
-    ):
-        raise RuntimeError(
-            f"Dagster returned invalid GraphQL introspection data for {type_name}.{field_kind}."
-        )
-
-    fields = frozenset(field["name"] for field in field_entries)
-    _type_fields[cache_key] = fields
-    return fields
-
-
-_RESOLVE_ASSET_SELECTION_SCHEMA = {
-    "Query": {"assetNodes"},
-    "AssetNode": {
-        "assetKey",
-        "groupName",
-        "tags",
-        "kinds",
-        "owners",
-        "dependencyKeys",
-        "jobNames",
-        "repository",
-        "isMaterializable",
-        "isExecutable",
-        "isObservable",
-        "isPartitioned",
-    },
-}
-_MATERIALIZE_ASSETS_SCHEMA = {
-    "Query": {
-        "assetNodes",
-        "assetNodeAdditionalRequiredKeys",
-        "assetNodeDefinitionCollisions",
-    },
-    "AssetNode": {
-        "assetKey",
-        "groupName",
-        "jobNames",
-        "isMaterializable",
-        "isExecutable",
-        "isObservable",
-        "isPartitioned",
-        "repository",
-        "assetChecksOrError",
-    },
-}
-
-
-def _dagster_19_compatibility_error(
-    tool_name: str,
-    required_fields: dict[str, set[str]],
-    env: str | None = None,
-) -> dict | None:
-    """Return a structured error when a Dagster 1.9+ tool lacks schema support."""
-    missing_fields = []
-    for type_name, required in required_fields.items():
-        available = _get_type_fields(type_name, env=env)
-        missing_fields.extend(
-            f"{type_name}.{field_name}" for field_name in sorted(required - available)
-        )
-    if not missing_fields:
-        return None
-    return {
-        "message": (
-            f"{tool_name} requires Dagster 1.9+; this instance is missing "
-            f"GraphQL fields: {', '.join(missing_fields)}."
-        )
-    }
 
 
 def gql(query: str, variables: dict | None = None, env: str | None = None) -> dict:
@@ -340,9 +218,6 @@ _METADATA_VALUE_FIELDS = {
 
 
 # Dagster log levels, ordered. level_filter selects this level and above.
-# Page size for the QUEUED runs probe in get_instance_status.
-_QUEUED_RUNS_PAGE_LIMIT = 100
-
 _LOG_LEVEL_ORDER: dict[str, int] = {
     "DEBUG": 0,
     "INFO": 1,
@@ -374,57 +249,152 @@ def _flatten_metadata(entries: list[dict] | None) -> list[dict]:
 # ── Runs ──────────────────────────────────────────────────────────────────────
 
 
+def _timestamp_input(value: str | float | None, name: str) -> float | None:
+    """Convert an ISO 8601 string or Unix seconds into Unix seconds for GraphQL.
+
+    A naive ISO string is read as UTC, which is how Dagster shows times.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an ISO 8601 string or Unix seconds, not a boolean.")
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be an ISO 8601 string (e.g. '2026-01-31T12:00:00Z') "
+            f"or Unix seconds; got {value!r}."
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _tag_inputs(tags: Mapping[str, str] | None) -> list[dict[str, str]]:
+    return [{"key": key, "value": value} for key, value in (tags or {}).items()]
+
+
+def _tag_value(tags: Sequence[Mapping[str, Any]] | None, key: str) -> str | None:
+    for tag in tags or []:
+        if tag.get("key") == key:
+            return tag.get("value")
+    return None
+
+
+# Tags Dagster puts on runs it launches for partitions and backfills.
+_PARTITION_TAG: Final[str] = "dagster/partition"
+_PARTITION_RANGE_START_TAG: Final[str] = "dagster/asset_partition_range_start"
+_PARTITION_RANGE_END_TAG: Final[str] = "dagster/asset_partition_range_end"
+_BACKFILL_TAG: Final[str] = "dagster/backfill"
+
+
+def _run_partition(run: Mapping[str, Any]) -> dict[str, str] | None:
+    """Return the partition (or partition range) a run targeted, from its tags."""
+    tags = run.get("tags")
+    partition = _tag_value(tags, _PARTITION_TAG)
+    if partition is not None:
+        return {"partition": partition}
+    start = _tag_value(tags, _PARTITION_RANGE_START_TAG)
+    end = _tag_value(tags, _PARTITION_RANGE_END_TAG)
+    if start is not None and end is not None:
+        return {"partition_range_start": start, "partition_range_end": end}
+    return None
+
+
 @mcp.tool()
 def get_runs(
     job_name: str | None = None,
     statuses: list[str] | None = None,
     limit: int = 10,
     env: str | None = None,
+    tags: dict[str, str] | None = None,
+    run_ids: list[str] | None = None,
+    created_after: str | float | None = None,
+    created_before: str | float | None = None,
+    updated_after: str | float | None = None,
+    cursor: str | None = None,
 ) -> list[dict]:
-    """List recent pipeline runs. Start here to discover what has been running.
+    """List runs, newest first. Start here to discover what has been running.
 
-    Returns runId, status, jobName, startTime, endTime, and tags for each run.
+    Returns runId, status, jobName, creationTime, startTime, endTime,
+    parentRunId, rootRunId, and tags for each run. Times are Unix seconds.
     Use the returned runId to drill into details with get_run_status,
     get_run_logs, get_run_stats, or get_run_failure_summary.
 
-    Filtering:
-    - job_name: filter by job (e.g. 'my_etl_job')
-    - statuses: filter by one or more statuses.
-      Valid values: 'SUCCESS', 'FAILURE', 'CANCELED', 'STARTED', 'QUEUED',
-      'STARTING', 'CANCELING', 'NOT_STARTED'.
-      Examples: ['FAILURE'], ['FAILURE', 'CANCELED'], ['STARTED', 'QUEUED']
+    Filters (combined with AND):
+    - job_name: exact job name (e.g. 'my_etl_job')
+    - statuses: one or more of 'SUCCESS', 'FAILURE', 'CANCELED', 'STARTED',
+      'QUEUED', 'STARTING', 'CANCELING', 'NOT_STARTED'
+    - tags: run tags that must all match, e.g.
+      {'dagster/partition': '2026-01-03'} for the runs of one partition, or
+      {'dagster/backfill': '<backfill id>'} for the runs of one backfill
+    - run_ids: only these runs
+    - created_after / created_before / updated_after: ISO 8601 strings
+      (e.g. '2026-01-31T00:00:00Z'; no time zone means UTC) or Unix seconds
     - limit: max runs to return (default 10)
+    - cursor: pass the runId of the last run of the previous page to get the
+      next page
 
     Typical workflows:
     - Find recent failures: get_runs(statuses=['FAILURE'])
-    - Check if a job ran today: get_runs(job_name='my_job', limit=5)
+    - Failures since this morning: get_runs(statuses=['FAILURE'],
+      created_after='2026-01-31T06:00:00Z')
+    - Why did a partition fail: get_runs(tags={'dagster/partition': '2026-01-03'})
     - Monitor active runs: get_runs(statuses=['STARTED', 'QUEUED'])
+
+    Runs of an asset backfill that cover a partition range carry the tags
+    'dagster/asset_partition_range_start' and '..._end' instead of
+    'dagster/partition'.
     """
     query = """
-    query Runs($limit: Int!, $filter: RunsFilter) {
-      runsOrError(limit: $limit, filter: $filter) {
+    query Runs($limit: Int!, $filter: RunsFilter, $cursor: String) {
+      runsOrError(limit: $limit, filter: $filter, cursor: $cursor) {
+        __typename
         ... on Runs {
           results {
             runId
             status
             jobName
+            creationTime
             startTime
             endTime
+            parentRunId
+            rootRunId
             tags { key value }
           }
         }
+        ... on InvalidPipelineRunsFilterError { message }
         ... on PythonError { message }
       }
     }
     """
-    filter_var: dict = {}
+    filter_var: dict[str, Any] = {}
     if statuses:
-        filter_var["statuses"] = statuses
+        filter_var["statuses"] = [status.upper() for status in statuses]
     if job_name:
-        field = _get_runs_filter_job_field(env)
-        filter_var[field] = job_name
-    data = gql(query, {"limit": limit, "filter": filter_var or None}, env=env)
-    runs = data.get("runsOrError", {})
+        filter_var["pipelineName"] = job_name
+    if tags:
+        filter_var["tags"] = _tag_inputs(tags)
+    if run_ids:
+        filter_var["runIds"] = run_ids
+    for name, field, value in (
+        ("created_after", "createdAfter", created_after),
+        ("created_before", "createdBefore", created_before),
+        ("updated_after", "updatedAfter", updated_after),
+    ):
+        timestamp = _timestamp_input(value, name)
+        if timestamp is not None:
+            filter_var[field] = timestamp
+    data = gql(
+        query,
+        {"limit": limit, "filter": filter_var or None, "cursor": cursor},
+        env=env,
+    )
+    runs = data.get("runsOrError") or {}
+    if runs.get("__typename") not in (None, "Runs"):
+        raise RuntimeError(f"Dagster could not list runs: {runs.get('message', 'unknown error')}")
     return runs.get("results", [])
 
 
@@ -707,6 +677,33 @@ def get_run_stats(run_id: str, env: str | None = None) -> dict:
     return data.get("runOrError", {})
 
 
+# Pages of run events that get_run_failure_summary reads, at the server's page
+# size (1000 events by default).
+_FAILURE_EVENTS_MAX_PAGES: Final[int] = 20
+
+# Frames kept from the end of a Python stack trace. The innermost frames name
+# the failing user code; the outer ones are mostly Dagster's executor.
+_STACK_FRAMES_KEPT: Final[int] = 8
+
+
+def _trim_error(error: Mapping[str, Any] | None) -> dict:
+    """Keep an error's message, class, and the end of its stack, for it and its causes."""
+    if not error:
+        return {}
+    trimmed: dict[str, Any] = {"message": error.get("message")}
+    if error.get("className"):
+        trimmed["className"] = error["className"]
+    stack = error.get("stack") or []
+    if stack:
+        trimmed["stack"] = "".join(stack[-_STACK_FRAMES_KEPT:])
+        if len(stack) > _STACK_FRAMES_KEPT:
+            trimmed["stack_frames_omitted"] = len(stack) - _STACK_FRAMES_KEPT
+    causes = [_trim_error(cause) for cause in error.get("causes") or []]
+    if causes:
+        trimmed["causes"] = causes
+    return trimmed
+
+
 @mcp.tool()
 def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
     """Get a consolidated failure diagnosis for a run in a single call.
@@ -717,8 +714,15 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
 
     Returns:
     - status, job_name, duration_seconds
+    - failure_reason: Dagster's reason tag, for example STEP_FAILURE or
+      UNEXPECTED_TERMINATION (the run process stopped), if set
     - failed_steps: list of {step_key, duration, error} for each failed step
-    - root_cause_error: the RunFailureEvent error (if any)
+    - root_cause_error: the run failure's error, or else the first failed
+      step's error.
+      Each error has message, className, the last frames of its stack trace,
+      and its causes. The user code's exception is usually the first cause.
+    - retried_steps: {step_key, retries} for each step that Dagster retried,
+      with last_error when the step did not end in failure
     - all_step_durations: timing for every step (not just failed ones)
     - suggestions: automated diagnostic hints (e.g. 'Multiple steps failed',
       'Step was retried before failing', 'Run was canceled')
@@ -726,7 +730,9 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
     If the run did not fail, returns {message: 'Run did not fail.'}.
 
     When to use: always prefer this over get_run_logs for failed runs.
-    Use get_run_logs only when you need the full event stream.
+    Use get_run_logs only when you need the full event stream. If the error
+    is not clear, get_compute_logs gives what the failed step printed to
+    stdout and stderr.
     """
     # 1. Fetch run status + step stats in one query
     status_query = """
@@ -738,6 +744,7 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
           jobName
           startTime
           endTime
+          tags { key value }
           stepStats {
             stepKey
             status
@@ -759,13 +766,16 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
     if status not in ("FAILURE", "CANCELED"):
         return {"run_id": run_id, "status": status, "message": "Run did not fail."}
 
-    # 2. Collect error events from logs (paginate up to 500 events)
+    # 2. Collect error events from logs. The run failure event is the last
+    # event, so read every page: the server's page size, up to a limit.
     error_events: list[dict] = []
     cursor = None
-    for _ in range(5):
+    scanned = 0
+    complete = False
+    for _ in range(_FAILURE_EVENTS_MAX_PAGES):
         log_query = """
         query FailureLogs($runId: ID!, $afterCursor: String) {
-          logsForRun(runId: $runId, afterCursor: $afterCursor, limit: 100) {
+          logsForRun(runId: $runId, afterCursor: $afterCursor) {
             ... on EventConnection {
               cursor
               hasMore
@@ -774,28 +784,30 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
                 ... on ExecutionStepFailureEvent {
                   timestamp
                   stepKey
-                  error { message causes { message } }
+                  error { ...FailureError causes { ...FailureError } }
                 }
                 ... on RunFailureEvent {
                   timestamp
-                  error { message causes { message } }
+                  error { ...FailureError causes { ...FailureError } }
                 }
                 ... on ExecutionStepUpForRetryEvent {
                   timestamp
                   stepKey
                   secondsToWait
-                  error { message causes { message } }
+                  error { ...FailureError causes { ...FailureError } }
                 }
               }
             }
             ... on RunNotFoundError { message }
           }
         }
+        fragment FailureError on PythonError { message className stack }
         """
         log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}, env=env).get(
             "logsForRun", {}
         )
         events = log_data.get("events", [])
+        scanned += len(events)
         for e in events:
             if e.get("__typename") in (
                 "ExecutionStepFailureEvent",
@@ -804,6 +816,7 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
             ):
                 error_events.append(e)
         if not log_data.get("hasMore"):
+            complete = True
             break
         cursor = log_data.get("cursor")
 
@@ -822,13 +835,21 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
             }
         )
 
-    # 4. Build failed steps with errors
+    # 4. Build failed steps with errors: the step's failure, else its last retry.
     failed_step_keys = {s["stepKey"] for s in step_stats if s["status"] == "FAILURE"}
-    step_errors: dict[str, dict] = {}
+    failure_errors: dict[str, dict] = {}
+    retry_errors: dict[str, dict] = {}
+    retry_counts: dict[str, int] = {}
     for e in error_events:
         sk = e.get("stepKey")
-        if sk and sk in failed_step_keys and sk not in step_errors:
-            step_errors[sk] = e.get("error", {})
+        if not sk:
+            continue
+        if e.get("__typename") == "ExecutionStepFailureEvent":
+            failure_errors.setdefault(sk, _trim_error(e.get("error")))
+        elif e.get("__typename") == "ExecutionStepUpForRetryEvent":
+            retry_errors[sk] = _trim_error(e.get("error"))
+            retry_counts[sk] = retry_counts.get(sk, 0) + 1
+    step_errors = {**retry_errors, **failure_errors}
 
     failed_steps = []
     for s in step_stats:
@@ -844,13 +865,18 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
                 }
             )
 
-    # 5. Root cause error (run-level failure or first step failure)
-    root_cause = None
+    # 5. Root cause error: the run failure's error. A run that failed because
+    # steps failed has a run failure event without an error; use the first step's.
     run_failure = [e for e in error_events if e.get("__typename") == "RunFailureEvent"]
-    if run_failure:
-        root_cause = run_failure[0].get("error", {})
-    elif failed_steps:
+    root_cause = _trim_error(run_failure[0].get("error")) if run_failure else {}
+    if not root_cause and failed_steps:
         root_cause = failed_steps[0].get("error", {})
+    retried_steps = []
+    for sk, count in retry_counts.items():
+        entry: dict[str, Any] = {"step_key": sk, "retries": count}
+        if sk not in failed_step_keys:
+            entry["last_error"] = retry_errors[sk]
+        retried_steps.append(entry)
 
     # 6. Suggestions
     suggestions: list[str] = []
@@ -865,6 +891,17 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
         )
     if status == "CANCELED":
         suggestions.append("Run was canceled, not all steps may have executed.")
+    running = [s["stepKey"] for s in step_stats if s["status"] == "IN_PROGRESS"]
+    if status == "FAILURE" and running:
+        suggestions.append(
+            f"Steps were still running when the run failed: {', '.join(running)}. The run "
+            "process stopped before they ended; see root_cause_error and failure_reason."
+        )
+    if not complete:
+        suggestions.append(
+            f"Only the first {scanned} events of the run were searched; later errors are "
+            "not included."
+        )
 
     run_dur = None
     if run_data.get("startTime") and run_data.get("endTime"):
@@ -875,14 +912,373 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
         "status": status,
         "job_name": run_data.get("jobName"),
         "duration_seconds": run_dur,
+        "failure_reason": _tag_value(run_data.get("tags"), "dagster/failure_reason"),
         "failed_steps": failed_steps,
-        "root_cause_error": root_cause,
+        "root_cause_error": root_cause or None,
+        "retried_steps": retried_steps,
         "all_step_durations": all_step_durations,
         "suggestions": suggestions,
     }
 
 
+# ── Compute logs ──────────────────────────────────────────────────────────────
+
+# Dagster names each process's stdout and stderr files with a random file key
+# and records it only in a LogsCapturedEvent, so the run's event log is the
+# index. The scan uses the server's page size (DAGSTER_UI_EVENT_LOAD_CHUNK_SIZE,
+# 1000 by default): Dagster 1.13.6 rejects a larger limit.
+_CAPTURE_EVENTS_MAX_PAGES: Final[int] = 20
+_CAPTURES_PER_STEP: Final[int] = 5
+
+_LOG_STREAMS: Final[tuple[str, str]] = ("stdout", "stderr")
+_LOG_DEFAULT_BYTES: Final[int] = 10_000
+_LOG_MIN_BYTES: Final[int] = 100
+_LOG_MAX_BYTES: Final[int] = 500_000
+# capturedLogs can read from an offset but cannot report a file's size. To
+# return the end of a long log, probe offsets for data: first doubling, then
+# in even steps, until the end is known to within max_bytes.
+_LOG_PROBE_LIMIT: Final[int] = 1 << 36  # 64 GiB; past this, show the start
+_LOG_PROBES_PER_ROUND: Final[int] = 32
+_LOG_PROBE_ROUNDS: Final[int] = 8
+_LOG_PAST_END: Final[int] = 1 << 40
+# Cloud compute log managers keep only this many bytes when they upload a log
+# (DAGSTER_TRUNCATE_COMPUTE_LOGS_UPLOAD_BYTES), and add no marker.
+_LOG_UPLOAD_CUT_BYTES: Final[int] = 50 * 1024 * 1024
+
+_CAPTURED_LOG_EVENTS_QUERY: Final[str] = """
+query CapturedLogEvents($runId: ID!, $afterCursor: String) {
+  logsForRun(runId: $runId, afterCursor: $afterCursor) {
+    __typename
+    ... on EventConnection {
+      cursor
+      hasMore
+      events {
+        __typename
+        ... on LogsCapturedEvent {
+          fileKey
+          stepKeys
+          externalStdoutUrl
+          externalStderrUrl
+        }
+      }
+    }
+    ... on RunNotFoundError { message }
+    ... on PythonError { message }
+  }
+}
+"""
+
+
+def _captured_log_events(run_id: str, env: str | None) -> tuple[list[dict], int | None]:
+    """Return the run's LogsCapturedEvents, one per file key.
+
+    The second value is None when the scan read all events, otherwise the
+    number of events it read.
+    """
+    captures: dict[str, dict] = {}
+    cursor = None
+    scanned = 0
+    for _ in range(_CAPTURE_EVENTS_MAX_PAGES):
+        result = gql(
+            _CAPTURED_LOG_EVENTS_QUERY, {"runId": run_id, "afterCursor": cursor}, env=env
+        ).get("logsForRun") or {}
+        if result.get("__typename") != "EventConnection":
+            raise RuntimeError(
+                result.get("message") or f"Dagster could not read the logs of run {run_id!r}."
+            )
+        events = result.get("events") or []
+        scanned += len(events)
+        for event in events:
+            if event.get("__typename") == "LogsCapturedEvent" and event.get("fileKey"):
+                captures.setdefault(event["fileKey"], event)
+        if not result.get("hasMore"):
+            return list(captures.values()), None
+        cursor = result.get("cursor")
+    return list(captures.values()), scanned
+
+
+def _log_offsets(cursor: str | None) -> tuple[int, int] | None:
+    """Parse a capturedLogs cursor, 'stdout_offset:stderr_offset', into byte offsets."""
+    try:
+        stdout_offset, stderr_offset = (int(part) for part in (cursor or "").split(":"))
+    except ValueError:
+        return None
+    return stdout_offset, stderr_offset
+
+
+def _read_captured_logs(
+    log_key: Sequence[str],
+    reads: Sequence[tuple[str | None, int]],
+    env: str | None,
+    with_metadata: bool = False,
+) -> dict:
+    """Send one request with a capturedLogs read per (cursor, limit) pair, aliased r0, r1, ..."""
+    definitions = ["$logKey: [String!]!"]
+    fields = []
+    variables: dict[str, Any] = {"logKey": list(log_key)}
+    if with_metadata:
+        fields.append(
+            "meta: capturedLogsMetadata(logKey: $logKey) "
+            "{ stdoutDownloadUrl stdoutLocation stderrDownloadUrl stderrLocation }"
+        )
+    for index, (cursor, limit) in enumerate(reads):
+        definitions += [f"$c{index}: String", f"$l{index}: Int"]
+        variables[f"c{index}"] = cursor
+        variables[f"l{index}"] = limit
+        fields.append(
+            f"r{index}: capturedLogs(logKey: $logKey, cursor: $c{index}, limit: $l{index}) "
+            "{ stdout stderr cursor }"
+        )
+    query = f"query CapturedLogs({', '.join(definitions)}) {{\n  " + "\n  ".join(fields) + "\n}"
+    return gql(query, variables, env=env)
+
+
+def _log_tail_text(text: str, max_bytes: int) -> str:
+    """Keep the last max_bytes of text, starting at a full line where one is near."""
+    # A read that starts inside a multi-byte character decodes it as U+FFFD.
+    text = text.lstrip("\ufffd")
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    tail = data[-max_bytes:].decode("utf-8", errors="ignore")
+    newline = tail.find("\n")
+    if 0 <= newline < len(tail) // 2:
+        tail = tail[newline + 1 :]
+    return tail
+
+
+def _log_cursor(positions: Mapping[str, int]) -> str:
+    """Build a capturedLogs cursor. A stream left out reads from past its end: nothing."""
+    return ":".join(str(positions.get(stream, _LOG_PAST_END)) for stream in _LOG_STREAMS)
+
+
+def _probe_log_ends(
+    log_key: Sequence[str],
+    bounds: dict[str, tuple[int, int | None]],
+    offsets_by_stream: Mapping[str, Sequence[int]],
+    env: str | None,
+) -> None:
+    """Read one byte at each offset, and narrow each stream's (lo, hi) bounds of its end."""
+    count = max(len(offsets) for offsets in offsets_by_stream.values())
+    reads = [
+        (_log_cursor({s: o[i] for s, o in offsets_by_stream.items() if i < len(o)}), 1)
+        for i in range(count)
+    ]
+    answer = _read_captured_logs(log_key, reads, env)
+    for stream, offsets in offsets_by_stream.items():
+        lo, hi = bounds[stream]
+        for i, offset in enumerate(offsets):
+            if (answer.get(f"r{i}") or {}).get(stream):
+                lo = max(lo, offset)
+            elif hi is None or offset < hi:
+                hi = offset
+        # A log that grew during the probes can show data past hi.
+        bounds[stream] = (lo, hi if hi is None or hi > lo else lo + 1)
+
+
+def _read_log_tails(
+    log_key: Sequence[str], streams: Sequence[str], max_bytes: int, env: str | None
+) -> tuple[dict[str, dict], dict]:
+    """Return {stream: {text, size_bytes, truncated}} with the end of each stream, and metadata."""
+    data = _read_captured_logs(log_key, [(None, max_bytes)], env, with_metadata=True)
+    head = data.get("r0") or {}
+    metadata = data.get("meta") or {}
+    offsets = _log_offsets(head.get("cursor"))
+
+    results: dict[str, dict] = {}
+    # For each stream longer than the first read: (lo, hi), where the log has a
+    # byte at offset lo and none at offset hi. hi is None until a probe finds it.
+    bounds: dict[str, tuple[int, int | None]] = {}
+    for index, stream in enumerate(_LOG_STREAMS):
+        if stream not in streams:
+            continue
+        text = head.get(stream) or ""
+        if offsets is None:
+            results[stream] = {"text": text, "size_bytes": None, "truncated": None}
+            if len(text.encode("utf-8")) >= max_bytes:
+                results[stream]["note"] = (
+                    "Dagster gave no log position, so only the start of the log is shown."
+                )
+        elif offsets[index] < max_bytes:
+            results[stream] = {"text": text, "size_bytes": offsets[index], "truncated": False}
+        else:
+            results[stream] = {"text": text, "size_bytes": None, "truncated": True}
+            bounds[stream] = (max_bytes - 1, None)
+    # Cloud log managers give a location only for a complete log. For a partial
+    # log, every read downloads the whole file again, so do not probe it.
+    for stream in list(bounds):
+        if not metadata.get(f"{stream}Location"):
+            del bounds[stream]
+            results[stream]["note"] = (
+                "Dagster gave no storage location for this log: the step still runs, or "
+                "its process stopped before the end. Only the start of the log is shown, "
+                "because each read can download the full log again. Use a larger max_bytes "
+                "to see more."
+            )
+    if not bounds:
+        return results, metadata
+
+    doubling = []
+    offset = max_bytes
+    while offset <= _LOG_PROBE_LIMIT:
+        doubling.append(offset)
+        offset *= 2
+    _probe_log_ends(log_key, bounds, dict.fromkeys(bounds, doubling), env)
+    for stream, (_lo, hi) in list(bounds.items()):
+        if hi is None:
+            del bounds[stream]
+            results[stream]["note"] = (
+                f"The log is larger than {_LOG_PROBE_LIMIT} bytes, so only its start is shown."
+            )
+
+    steps = _LOG_PROBES_PER_ROUND + 1
+    for _ in range(_LOG_PROBE_ROUNDS):
+        wide = {s: (lo, hi) for s, (lo, hi) in bounds.items() if hi - lo > max_bytes}
+        if not wide:
+            break
+        evenly = {
+            s: [lo + (hi - lo) * j // steps for j in range(1, steps)]
+            for s, (lo, hi) in wide.items()
+        }
+        _probe_log_ends(log_key, bounds, evenly, env)
+
+    if not bounds:
+        return results, metadata
+    starts = {s: max(0, lo + 1 - max_bytes) for s, (lo, _hi) in bounds.items()}
+    limit = max(hi - starts[s] for s, (_lo, hi) in bounds.items())
+    tail = _read_captured_logs(log_key, [(_log_cursor(starts), limit)], env).get("r0") or {}
+    end = _log_offsets(tail.get("cursor"))
+    for stream in bounds:
+        size = end[_LOG_STREAMS.index(stream)] if end else None
+        results[stream] = {
+            "text": _log_tail_text(tail.get(stream) or "", max_bytes),
+            "size_bytes": size,
+            "truncated": size is None or size > max_bytes,
+        }
+        location = metadata.get(f"{stream}Location") or ""
+        if size == _LOG_UPLOAD_CUT_BYTES and not location.startswith("/"):
+            results[stream]["note"] = (
+                "Dagster keeps only the first 50 MiB of a log that it uploads to cloud "
+                "storage, so this text is not the real end of the log."
+            )
+    return results, metadata
+
+
+def _log_capture_entry(capture: Mapping[str, Any]) -> dict:
+    return {"file_key": capture.get("fileKey"), "step_keys": capture.get("stepKeys") or []}
+
+
+@mcp.tool()
+def get_compute_logs(
+    run_id: str,
+    step_key: str | None = None,
+    stream: str = "both",
+    max_bytes: int = _LOG_DEFAULT_BYTES,
+    env: str | None = None,
+) -> dict:
+    """Get what a run's steps printed to stdout and stderr (Dagster's compute logs).
+
+    Dagster saves the stdout and stderr of each process that runs steps. These
+    logs often hold the cause of a failure that the event log does not show:
+    output of dbt, Spark, or shell commands, print() output, and full Python
+    tracebacks.
+
+    Parameters:
+    - run_id: the run
+    - step_key: the step to read. get_run_failure_summary and get_run_stats
+      give the step keys. If you omit it and the run captured logs in more
+      than one process, the result lists the captures and their step keys,
+      without log text.
+    - stream: 'stdout', 'stderr', or 'both' (default). Python logging and
+      tracebacks usually go to stderr; print() goes to stdout.
+    - max_bytes: bytes to return per stream (default 10000, from 100 to
+      500000). For a longer log, the result has the END of the log, where
+      errors usually are. Exception: a cloud-stored log of a step that still
+      runs, or whose process stopped early, gives the start and a note.
+
+    Returns run_id and captures, one per process. A retried step can have one
+    capture per attempt; the last 5 are returned, oldest first. Each has:
+    - file_key, step_keys: all steps that ran in that process. With the
+      in-process executor, all steps share one log.
+    - stdout, stderr: {text, size_bytes, truncated}. truncated is true when
+      text is only the end of the log.
+    - stdout_location, stderr_location: where Dagster stores the file, for
+      example a path or an s3:// URL
+    - external_stdout_url, external_stderr_url: links, when the log storage
+      gives links instead of text
+    """
+    stream_key = stream.lower()
+    if stream_key not in ("stdout", "stderr", "both"):
+        raise ValueError(f"stream must be 'stdout', 'stderr', or 'both'; got {stream!r}.")
+    streams = _LOG_STREAMS if stream_key == "both" else (stream_key,)
+    if not _LOG_MIN_BYTES <= max_bytes <= _LOG_MAX_BYTES:
+        raise ValueError(
+            f"max_bytes must be from {_LOG_MIN_BYTES} to {_LOG_MAX_BYTES}; got {max_bytes}."
+        )
+
+    captures, scanned = _captured_log_events(run_id, env)
+    result: dict[str, Any] = {"run_id": run_id}
+    if scanned is not None:
+        result["note"] = (
+            f"Only the first {scanned} events of the run were searched for captured logs. "
+            "Later steps can have logs that are not listed."
+        )
+    if not captures:
+        result["captures"] = []
+        result["message"] = (
+            "This run has no captured logs. Its steps did not start, or the "
+            "instance does not capture compute logs."
+        )
+        return result
+
+    if step_key is not None:
+        selected = [c for c in captures if step_key in (c.get("stepKeys") or [])]
+        if not selected:
+            known = sorted({key for c in captures for key in c.get("stepKeys") or []})
+            shown = ", ".join(known[:50])
+            if len(known) > 50:
+                shown += f", and {len(known) - 50} more"
+            result["captures"] = []
+            result["message"] = f"No captured logs for step {step_key!r}. Steps with logs: {shown}."
+            return result
+        selected = selected[-_CAPTURES_PER_STEP:]
+    elif len(captures) > 1:
+        result["captures"] = [_log_capture_entry(c) for c in captures]
+        result["message"] = (
+            f"This run captured logs in {len(captures)} processes. Pass step_key to "
+            "read the logs of one step."
+        )
+        return result
+    else:
+        selected = captures
+
+    entries = []
+    for capture in selected:
+        entry = _log_capture_entry(capture)
+        log_key = [run_id, "compute_logs", capture["fileKey"]]
+        texts, metadata = _read_log_tails(log_key, streams, max_bytes, env)
+        for name in streams:
+            entry[name] = texts[name]
+            location = metadata.get(f"{name}Location")
+            if location:
+                entry[f"{name}_location"] = location
+            external = capture.get(f"external{name.capitalize()}Url")
+            if external:
+                entry[f"external_{name}_url"] = external
+        entries.append(entry)
+    result["captures"] = entries
+    return result
+
+
 # ── Assets ────────────────────────────────────────────────────────────────────
+
+
+def _asset_key_input(asset_key: str) -> dict:
+    return {"path": asset_key.split("/")}
+
+
+def _asset_node_key(node: dict) -> str:
+    return "/".join(node.get("assetKey", {}).get("path", []))
 
 
 @mcp.tool()
@@ -890,81 +1286,164 @@ def get_recent_materializations(
     asset_key: str,
     limit: int = 5,
     env: str | None = None,
+    partitions: list[str] | None = None,
 ) -> list[dict]:
-    """Get the most recent materializations for an asset, with metadata.
+    """Get the most recent materializations for an asset, newest first, with metadata.
 
-    Returns a list of materializations, each with: runId, timestamp,
-    assetKey, and metadataEntries (labels, numeric values, text).
+    Returns a list of materializations, each with: runId, timestamp (Unix
+    milliseconds, as a string), partition (null for unpartitioned assets),
+    stepKey, assetKey, and metadataEntries as {label, description, value}.
 
-    - asset_key: the asset name as a string (e.g. 'my_daily_report')
+    - asset_key: the asset key, '/'-separated for nested keys (e.g. 'raw/orders')
     - limit: max materializations to return (default 5)
+    - partitions: only materializations of these partition keys
+      (e.g. ['2026-01-03']). Multi-partition keys look like '2026-01-03|eu'.
 
-    When to use: to check when an asset was last materialized, track
-    materialization frequency, or inspect metadata from recent runs.
-    For a broader health view (including staleness and freshness),
-    use get_asset_health instead.
+    When to use: to check when an asset or a partition was last
+    materialized, track materialization frequency, or inspect metadata from
+    recent runs. For which partitions failed, use get_asset_partition_status.
+    For a broader health view, use get_asset_health. Raises when the asset
+    does not exist, so an empty list means it has no materializations.
     """
-    query = """
-    query AssetRuns($assetKey: AssetKeyInput!, $limit: Int!) {
+    query = (
+        """
+    query AssetRuns($assetKey: AssetKeyInput!, $limit: Int!, $partitions: [String!]) {
       assetOrError(assetKey: $assetKey) {
+        __typename
         ... on Asset {
-          assetMaterializations(limit: $limit) {
+          assetMaterializations(limit: $limit, partitions: $partitions) {
             runId
             timestamp
+            partition
+            stepKey
             assetKey { path }
-            metadataEntries {
-              label
-              ... on IntMetadataEntry { intValue }
-              ... on FloatMetadataEntry { floatValue }
-              ... on TextMetadataEntry { text }
-            }
+__METADATA_ENTRIES__
           }
         }
+        ... on AssetNotFoundError { message }
       }
     }
     """
-    data = gql(query, {"assetKey": {"path": asset_key.split("/")}, "limit": limit}, env=env)
-    asset = data.get("assetOrError", {})
-    return asset.get("assetMaterializations", [])
+    ).replace("__METADATA_ENTRIES__", _METADATA_ENTRIES_FRAGMENT)
+    variables = {"assetKey": _asset_key_input(asset_key), "limit": limit, "partitions": partitions}
+    asset = gql(query, variables, env=env).get("assetOrError") or {}
+    if asset.get("__typename") == "AssetNotFoundError":
+        raise RuntimeError(f"Asset {asset_key!r} not found.")
+    events = asset.get("assetMaterializations") or []
+    for event in events:
+        event["metadataEntries"] = _flatten_metadata(event.get("metadataEntries"))
+    return events
+
+
+# Both freshness policy kinds. internalFreshnessPolicy is the newer policy
+# (FreshnessPolicy.time_window / .cron in code); freshnessPolicy is the
+# deprecated LegacyFreshnessPolicy.
+_FRESHNESS_POLICY_SELECTION: Final[str] = """
+        freshnessPolicy { maximumLagMinutes cronSchedule cronScheduleTimezone }
+        internalFreshnessPolicy {
+          __typename
+          ... on TimeWindowFreshnessPolicy { failWindowSeconds warnWindowSeconds }
+          ... on CronFreshnessPolicy { deadlineCron lowerBoundDeltaSeconds timezone }
+        }"""
+
+
+def _freshness_policy(node: Mapping[str, Any]) -> dict | None:
+    """Describe an asset's freshness policy, preferring the newer kind."""
+    policy = node.get("internalFreshnessPolicy")
+    if policy:
+        if policy.get("__typename") == "TimeWindowFreshnessPolicy":
+            return {
+                "type": "time_window",
+                "fail_window_seconds": policy.get("failWindowSeconds"),
+                "warn_window_seconds": policy.get("warnWindowSeconds"),
+            }
+        if policy.get("__typename") == "CronFreshnessPolicy":
+            return {
+                "type": "cron",
+                "deadline_cron": policy.get("deadlineCron"),
+                "lower_bound_delta_seconds": policy.get("lowerBoundDeltaSeconds"),
+                "timezone": policy.get("timezone"),
+            }
+        return {"type": policy.get("__typename")}
+    legacy = node.get("freshnessPolicy")
+    if legacy:
+        return {
+            "type": "legacy",
+            "max_lag_minutes": legacy.get("maximumLagMinutes"),
+            "cron": legacy.get("cronSchedule"),
+            "cron_timezone": legacy.get("cronScheduleTimezone"),
+        }
+    return None
 
 
 @mcp.tool()
 def get_asset_details(asset_keys: list[str], env: str | None = None) -> list[dict]:
-    """Get detailed metadata for one or more assets: description, lineage, and partitions.
+    """Get detailed metadata for one or more assets: description, lineage, ownership, partitions.
 
-    - asset_keys: list of asset name strings (e.g. ['my_extract', 'my_load'])
+    - asset_keys: list of asset keys, '/'-separated for nested keys
+      (e.g. ['my_extract', 'raw/orders'])
 
-    Returns per asset: assetKey, description, groupName, op name,
-    isObservable, isPartitioned, partitionDefinition, dependencyKeys
-    (upstream assets), dependedByKeys (downstream assets), and the
-    latest materialization (runId + timestamp).
+    Returns per asset: assetKey, description, groupName, kinds, owners,
+    tags, op name, jobNames, repository (name and code location),
+    isMaterializable, isExecutable, isObservable, isPartitioned,
+    partitionDefinition (description, type, dimensions), pools,
+    automationCondition (its label, if the asset uses declarative
+    automation), freshness_policy, hasAssetChecks, dependencyKeys (upstream
+    assets), dependedByKeys (downstream assets), and the latest
+    materialization (runId, timestamp, partition).
 
     When to use: to understand an asset's lineage (what it depends on
-    and what depends on it), check if it's partitioned, or get its
-    description. Use search_assets first if you don't know the exact key.
+    and what depends on it), who owns it, how it is automated, or how it
+    is partitioned. Use search_assets first if you don't know the exact key.
     """
-    query = """
+    query = (
+        """
     query AssetDetails($assetKeys: [AssetKeyInput!]!) {
       assetNodes(assetKeys: $assetKeys) {
         assetKey { path }
         description
         groupName
+        kinds
+        owners {
+          __typename
+          ... on TeamAssetOwner { team }
+          ... on UserAssetOwner { email }
+        }
+        tags { key value }
         op { name }
+        jobNames
+        repository { name location { name } }
+        isMaterializable
+        isExecutable
         isObservable
         isPartitioned
-        partitionDefinition { description }
+        partitionDefinition {
+          description
+          type
+          dimensionTypes { name type }
+        }
+        pools
+        automationCondition { label }
+        hasAssetChecks
+__FRESHNESS__
         dependencyKeys { path }
         dependedByKeys { path }
         assetMaterializations(limit: 1) {
           runId
           timestamp
+          partition
         }
       }
     }
     """
-    keys = [{"path": k.split("/")} for k in asset_keys]
-    data = gql(query, {"assetKeys": keys}, env=env)
-    return data.get("assetNodes", [])
+    ).replace("__FRESHNESS__", _FRESHNESS_POLICY_SELECTION)
+    keys = [_asset_key_input(k) for k in asset_keys]
+    nodes = gql(query, {"assetKeys": keys}, env=env).get("assetNodes", [])
+    for node in nodes:
+        node["freshness_policy"] = _freshness_policy(node)
+        node.pop("freshnessPolicy", None)
+        node.pop("internalFreshnessPolicy", None)
+    return nodes
 
 
 @mcp.tool()
@@ -1035,14 +1514,6 @@ def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dic
             "message": str(exc),
         }
 
-    compatibility_error = _dagster_19_compatibility_error(
-        "resolve_asset_selection",
-        _RESOLVE_ASSET_SELECTION_SCHEMA,
-        env=env,
-    )
-    if compatibility_error:
-        return compatibility_error
-
     query = """
     query AssetSelectionGraph {
       assetNodes {
@@ -1099,26 +1570,168 @@ def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dic
     }
 
 
+_ASSET_HEALTH_QUERY: Final[str] = (
+    """
+query AssetHealth($assetKeys: [AssetKeyInput!]!) {
+  assetNodes(assetKeys: $assetKeys) {
+    assetKey { path }
+    groupName
+    isMaterializable
+    isPartitioned
+    partitionStats { numPartitions numMaterialized numFailed numMaterializing }
+__FRESHNESS__
+    freshnessStatusInfo { freshnessStatus }
+    staleCauses { reason dependency { path } }
+    automationCondition { label }
+    assetChecksOrError {
+      __typename
+      ... on AssetChecks {
+        checks {
+          name
+          executionForLatestMaterialization {
+            status
+            evaluation { severity }
+          }
+        }
+      }
+    }
+  }
+  assetsLatestInfo(assetKeys: $assetKeys) {
+    assetKey { path }
+    latestMaterialization { runId timestamp partition }
+    latestRun { runId status endTime }
+    inProgressRunIds
+    unstartedRunIds
+  }
+  assetsOrError(assetKeys: $assetKeys) {
+    __typename
+    ... on AssetConnection {
+      nodes {
+        key { path }
+        assetHealth {
+          assetHealth
+          materializationStatus
+          assetChecksStatus
+          freshnessStatus
+        }
+      }
+    }
+  }
+}
+"""
+).replace("__FRESHNESS__", _FRESHNESS_POLICY_SELECTION)
+
+_FAILED_RUN_STATUSES: Final[frozenset[str]] = frozenset({"FAILURE", "CANCELED"})
+_UNHEALTHY_STATUSES: Final[frozenset[str]] = frozenset({"WARNING", "DEGRADED"})
+
+
+def _check_summary(node: Mapping[str, Any]) -> dict | None:
+    """Group an asset's checks by the result of their run against the latest materialization."""
+    checks_or_error = node.get("assetChecksOrError") or {}
+    if checks_or_error.get("__typename") != "AssetChecks":
+        return None
+    checks = checks_or_error.get("checks") or []
+    if not checks:
+        return None
+    summary: dict[str, Any] = {
+        "total": len(checks),
+        "failed": [],
+        "warning": [],
+        "execution_failed": [],
+        "not_run": [],
+    }
+    for check in checks:
+        execution = check.get("executionForLatestMaterialization") or {}
+        status = execution.get("status")
+        severity = (execution.get("evaluation") or {}).get("severity")
+        if status == "FAILED":
+            summary["warning" if severity == "WARN" else "failed"].append(check["name"])
+        elif status == "EXECUTION_FAILED":
+            summary["execution_failed"].append(check["name"])
+        elif status is None:
+            summary["not_run"].append(check["name"])
+    return summary
+
+
+def _health_issues(entry: Mapping[str, Any]) -> list[str]:
+    """Plain-language problems that need attention, derived from one asset's health entry."""
+    issues = []
+    latest_run = entry.get("latest_run") or {}
+    materialization = entry.get("last_materialization") or {}
+    # A run can fail in a later step after it materialized this asset; the
+    # Dagster UI does not flag the asset then, and neither does this.
+    if (
+        latest_run.get("status") in _FAILED_RUN_STATUSES
+        and latest_run.get("run_id") != materialization.get("run_id")
+    ):
+        issues.append(
+            f"Latest run {latest_run['run_id']} ended with {latest_run['status']}; "
+            "use get_run_failure_summary."
+        )
+    partitions = entry.get("partitions") or {}
+    if partitions.get("failed"):
+        issues.append(
+            f"{partitions['failed']} failed partition(s); use get_asset_partition_status."
+        )
+    checks = entry.get("checks") or {}
+    for name in checks.get("failed", []):
+        issues.append(f"Check {name!r} failed (ERROR severity).")
+    for name in checks.get("warning", []):
+        issues.append(f"Check {name!r} failed (WARN severity).")
+    for name in checks.get("execution_failed", []):
+        issues.append(f"Check {name!r} could not execute.")
+    if entry.get("freshness_status") in _UNHEALTHY_STATUSES:
+        issues.append(f"Freshness status is {entry['freshness_status']}.")
+    health = (entry.get("dagster_health") or {}).get("assetHealth")
+    if health in _UNHEALTHY_STATUSES:
+        issues.append(f"Dagster reports the asset as {health}.")
+    if entry.get("materializable") and not entry.get("last_materialization") and not (
+        latest_run or partitions
+    ):
+        issues.append("Asset has never been materialized.")
+    return issues
+
+
 @mcp.tool()
 def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[dict]:
     """Get a consolidated health view for a single asset or all assets in a group.
 
     This is the BEST tool to assess whether assets are healthy and up-to-date.
 
-    - asset_key_or_group: pass either a single asset key (e.g. 'my_report')
-      or a group name (e.g. 'analytics'). If it matches a group, returns
-      health for ALL assets in that group.
+    - asset_key_or_group: pass either a single asset key (e.g. 'my_report',
+      'raw/orders') or a group name (e.g. 'analytics'). If it matches a group,
+      returns health for ALL assets in that group.
 
     Returns per asset:
-    - asset_key, group, description
-    - last_materialization: {run_id, timestamp, status} of the latest run
-    - freshness_policy: {maximum_lag_minutes, cron_schedule} if defined
-    - staleness: {is_stale, reasons[]} explaining why the asset is stale
+    - asset_key, group, materializable (false for external or observable
+      assets)
+    - issues: plain-language problems that need attention (empty if none
+      were found): a latest run that failed before it materialized the
+      asset, failed partitions, failed checks, a WARNING or DEGRADED
+      freshness status, or no materialization at all
+    - latest_run: {run_id, status, end_time} of the most recent run that
+      targeted the asset, whatever its result. latest_run_status repeats
+      its status. Times in this tool are Unix seconds
+    - runs_in_progress, runs_queued: run ids of runs that target the asset now
+    - last_materialization: {run_id, timestamp, partition} of the latest
+      successful materialization
+    - partitions: {total, materialized, failed, materializing} for
+      partitioned assets
+    - checks: {total, failed, warning, execution_failed, not_run} with
+      check names, judged against the latest materialization
+    - freshness_policy and freshness_status (HEALTHY, WARNING, DEGRADED,
+      UNKNOWN) when the asset has a freshness policy
+    - stale, stale_causes: whether upstream data or code changed since the
+      last materialization
+    - automation_condition: label of the asset's automation condition, if any.
+      get_asset_automation explains why automation did or did not run it.
+    - dagster_health: Dagster's own health status, only on deployments that
+      compute it (Dagster+)
 
-    When to use: to check if critical assets are fresh, find stale assets
-    in a group, or verify that recent materializations succeeded.
-    Prefer this over get_recent_materializations when you need a health
-    assessment rather than raw materialization history.
+    When to use: to check if critical assets are fresh, find failing assets
+    in a group, or verify that recent runs succeeded. Prefer this over
+    get_recent_materializations when you need a health assessment rather
+    than raw materialization history.
     """
     # First try as a group — fetch all assets and filter
     all_query = """
@@ -1129,95 +1742,908 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
       }
     }
     """
-    all_data = gql(all_query, env=env)
-    all_nodes = all_data.get("assetNodes", [])
-
-    # Check if it's a group name
+    all_nodes = gql(all_query, env=env).get("assetNodes", [])
     group_keys = [
         n["assetKey"]["path"]
         for n in all_nodes
         if (n.get("groupName") or "").lower() == asset_key_or_group.lower()
     ]
-
     if group_keys:
         asset_keys_input = [{"path": k} for k in group_keys]
     else:
-        asset_keys_input = [{"path": asset_key_or_group.split("/")}]
+        asset_keys_input = [_asset_key_input(asset_key_or_group)]
 
-    # Fetch health details
-    health_query = """
-    query AssetHealth($assetKeys: [AssetKeyInput!]!) {
-      assetNodes(assetKeys: $assetKeys) {
-        assetKey { path }
-        groupName
-        freshnessPolicy { maximumLagMinutes cronSchedule }
-        staleCauses { key { path } reason dependency { path } }
-        assetMaterializations(limit: 1) {
-          runId
-          timestamp
-        }
-      }
-    }
-    """
-    health_data = gql(health_query, {"assetKeys": asset_keys_input}, env=env)
-    nodes = health_data.get("assetNodes", [])
-
+    data = gql(_ASSET_HEALTH_QUERY, {"assetKeys": asset_keys_input}, env=env)
+    nodes = data.get("assetNodes", [])
     if not nodes:
         return [{"asset_key": asset_key_or_group, "message": "Asset not found."}]
 
-    # For each asset, get the latest run status if there's a materialization
-    run_ids = set()
-    for n in nodes:
-        mats = n.get("assetMaterializations", [])
-        if mats:
-            run_ids.add(mats[0]["runId"])
-
-    run_statuses: dict[str, str] = {}
-    if run_ids:
-        runs_query = """
-        query RunStatuses($filter: RunsFilter) {
-          runsOrError(filter: $filter, limit: 100) {
-            ... on Runs {
-              results { runId status }
-            }
-          }
-        }
-        """
-        runs_data = gql(runs_query, {"filter": {"runIds": list(run_ids)}}, env=env)
-        for r in runs_data.get("runsOrError", {}).get("results", []):
-            run_statuses[r["runId"]] = r["status"]
+    latest_by_key = {
+        "/".join(info["assetKey"]["path"]): info
+        for info in data.get("assetsLatestInfo") or []
+    }
+    assets = data.get("assetsOrError") or {}
+    asset_nodes = assets.get("nodes") or [] if assets.get("__typename") == "AssetConnection" else []
+    health_by_key = {
+        "/".join(asset["key"]["path"]): asset.get("assetHealth")
+        for asset in asset_nodes
+    }
 
     results = []
-    for n in nodes:
-        mats = n.get("assetMaterializations", [])
-        last_mat = None
-        latest_run_status = None
-        if mats:
-            last_mat = {"run_id": mats[0]["runId"], "timestamp": mats[0]["timestamp"]}
-            latest_run_status = run_statuses.get(mats[0]["runId"])
-
-        fp = n.get("freshnessPolicy")
-        freshness_policy = None
-        if fp:
-            freshness_policy = {
-                "max_lag_minutes": fp.get("maximumLagMinutes"),
-                "cron": fp.get("cronSchedule"),
+    seen: set[str] = set()
+    for node in nodes:
+        key = _asset_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        latest = latest_by_key.get(key) or {}
+        materialization = latest.get("latestMaterialization")
+        run = latest.get("latestRun")
+        entry: dict[str, Any] = {
+            "asset_key": key,
+            "group": node.get("groupName"),
+            "issues": [],
+            "materializable": node.get("isMaterializable"),
+            "latest_run": (
+                {"run_id": run["runId"], "status": run["status"], "end_time": run.get("endTime")}
+                if run
+                else None
+            ),
+            "latest_run_status": run["status"] if run else None,
+            "runs_in_progress": latest.get("inProgressRunIds") or [],
+            "runs_queued": latest.get("unstartedRunIds") or [],
+            "last_materialization": (
+                {
+                    "run_id": materialization["runId"],
+                    # Dagster sends milliseconds as a string; match end_time.
+                    "timestamp": float(materialization["timestamp"]) / 1000,
+                    "partition": materialization.get("partition"),
+                }
+                if materialization
+                else None
+            ),
+        }
+        stats = node.get("partitionStats")
+        if node.get("isPartitioned") and stats:
+            entry["partitions"] = {
+                "total": stats["numPartitions"],
+                "materialized": stats["numMaterialized"],
+                "failed": stats["numFailed"],
+                "materializing": stats["numMaterializing"],
             }
-
-        stale_causes = n.get("staleCauses", [])
-        results.append(
-            {
-                "asset_key": n["assetKey"]["path"],
-                "group": n.get("groupName"),
-                "last_materialization": last_mat,
-                "latest_run_status": latest_run_status,
-                "freshness_policy": freshness_policy,
-                "stale": len(stale_causes) > 0,
-                "stale_causes": [c.get("reason", "") for c in stale_causes],
-            }
-        )
-
+        checks = _check_summary(node)
+        if checks:
+            entry["checks"] = checks
+        freshness_policy = _freshness_policy(node)
+        if freshness_policy:
+            entry["freshness_policy"] = freshness_policy
+        freshness_status = (node.get("freshnessStatusInfo") or {}).get("freshnessStatus")
+        if freshness_status:
+            entry["freshness_status"] = freshness_status
+        stale_causes = node.get("staleCauses") or []
+        entry["stale"] = bool(stale_causes)
+        entry["stale_causes"] = [c.get("reason", "") for c in stale_causes]
+        automation = (node.get("automationCondition") or {}).get("label")
+        if automation:
+            entry["automation_condition"] = automation
+        if health_by_key.get(key):
+            entry["dagster_health"] = health_by_key[key]
+        entry["issues"] = _health_issues(entry)
+        results.append(entry)
     return results
+
+
+# Statuses a partition can have, as reported by get_asset_partition_status.
+# The first three come from Dagster; "missing" is every other partition key.
+_PARTITION_STATUS_NAMES: Final[tuple[str, ...]] = (
+    "failed",
+    "materializing",
+    "materialized",
+    "missing",
+)
+
+_ASSET_PARTITION_STATUS_QUERY: Final[str] = """
+query AssetPartitionStatus($assetKeys: [AssetKeyInput!]!) {
+  assetNodes(assetKeys: $assetKeys) {
+    assetKey { path }
+    isPartitioned
+    partitionDefinition { description }
+    partitionKeysByDimension { name partitionKeys }
+    assetPartitionStatuses {
+      __typename
+      ...DefaultStatuses
+      ...TimeStatuses
+      ... on MultiPartitionStatuses {
+        primaryDimensionName
+        ranges {
+          primaryDimStartKey
+          primaryDimEndKey
+          secondaryDim {
+            __typename
+            ...DefaultStatuses
+            ...TimeStatuses
+          }
+        }
+      }
+    }
+  }
+}
+fragment DefaultStatuses on DefaultPartitionStatuses {
+  materializedPartitions
+  failedPartitions
+  materializingPartitions
+}
+fragment TimeStatuses on TimePartitionStatuses {
+  ranges { startKey endKey status }
+}
+"""
+
+
+def _keys_by_status_1d(
+    statuses: Mapping[str, Any],
+    keys: Sequence[str],
+    unresolved: list[dict[str, str]],
+) -> dict[str, list[str]]:
+    """Map materialized/failed/materializing to partition keys for one dimension.
+
+    Time-window statuses arrive as key ranges; they are expanded with ``keys``,
+    the dimension's ordered partition keys. A range whose endpoint is not a
+    current key cannot be expanded, so it goes to ``unresolved`` rather than
+    being dropped without notice.
+    """
+    typename = statuses.get("__typename")
+    if typename == "DefaultPartitionStatuses":
+        return {
+            "materialized": list(statuses.get("materializedPartitions") or []),
+            "failed": list(statuses.get("failedPartitions") or []),
+            "materializing": list(statuses.get("materializingPartitions") or []),
+        }
+    if typename != "TimePartitionStatuses":
+        raise RuntimeError(f"Dagster returned an unexpected partition status type {typename!r}.")
+
+    positions = {key: index for index, key in enumerate(keys)}
+    result: dict[str, list[str]] = {"materialized": [], "failed": [], "materializing": []}
+    for status_range in statuses.get("ranges") or []:
+        status = str(status_range.get("status", "")).lower()
+        start_key = status_range.get("startKey")
+        end_key = status_range.get("endKey")
+        start = positions.get(start_key)
+        end = positions.get(end_key)
+        if status not in result or start is None or end is None:
+            unresolved.append({"status": status, "start": start_key, "end": end_key})
+            continue
+        result[status].extend(keys[start : end + 1])
+    return result
+
+
+def _multi_partition_key(keys_by_dimension: Mapping[str, str]) -> str:
+    # Dagster joins a multi-partition key's parts in dimension-name order.
+    return "|".join(key for _, key in sorted(keys_by_dimension.items()))
+
+
+def _partition_status_lists(
+    node: Mapping[str, Any],
+) -> tuple[list[str], dict[str, list[str]], list[dict[str, str]]]:
+    """Return (all keys in order, keys by Dagster status, unresolved ranges) for an asset."""
+    dimensions = {
+        dimension["name"]: list(dimension.get("partitionKeys") or [])
+        for dimension in node.get("partitionKeysByDimension") or []
+    }
+    statuses = node.get("assetPartitionStatuses") or {}
+    unresolved: list[dict[str, str]] = []
+
+    if statuses.get("__typename") != "MultiPartitionStatuses":
+        keys = next(iter(dimensions.values()), [])
+        return keys, _keys_by_status_1d(statuses, keys, unresolved), unresolved
+
+    primary = statuses.get("primaryDimensionName")
+    secondaries = [name for name in dimensions if name != primary]
+    if primary not in dimensions or len(secondaries) != 1:
+        raise RuntimeError(
+            "Dagster returned multi-partition statuses that do not match the "
+            f"asset's dimensions (primary {primary!r}, dimensions {sorted(dimensions)})."
+        )
+    secondary = secondaries[0]
+    primary_keys = dimensions[primary]
+    secondary_keys = dimensions[secondary]
+    primary_positions = {key: index for index, key in enumerate(primary_keys)}
+
+    def combine(primary_key: str, secondary_key: str) -> str:
+        return _multi_partition_key({primary: primary_key, secondary: secondary_key})
+
+    by_status: dict[str, list[str]] = {"materialized": [], "failed": [], "materializing": []}
+    for status_range in statuses.get("ranges") or []:
+        start_key = status_range.get("primaryDimStartKey")
+        end_key = status_range.get("primaryDimEndKey")
+        start = primary_positions.get(start_key)
+        end = primary_positions.get(end_key)
+        if start is None or end is None:
+            unresolved.append({"status": "unknown", "start": start_key, "end": end_key})
+            continue
+        secondary_by_status = _keys_by_status_1d(
+            status_range.get("secondaryDim") or {}, secondary_keys, unresolved
+        )
+        for primary_key in primary_keys[start : end + 1]:
+            for status, keys in secondary_by_status.items():
+                by_status[status].extend(combine(primary_key, key) for key in keys)
+
+    all_keys = [combine(p, s) for p in primary_keys for s in secondary_keys]
+    return all_keys, by_status, unresolved
+
+
+@mcp.tool()
+def get_asset_partition_status(
+    asset_keys: list[str],
+    statuses: list[str] | None = None,
+    limit: int = 1000,
+    env: str | None = None,
+    failed_run_limit: int = 20,
+) -> list[dict]:
+    """List which partitions of partitioned assets failed, are running, are done, or are missing.
+
+    This is the same per-partition view the Dagster UI shows on an asset's
+    Partitions tab. Use it to find failed partitions before re-launching them.
+
+    - asset_keys: one or more asset keys, '/'-separated for nested keys
+      (e.g. ['raw/orders', 'daily_revenue'])
+    - statuses: which partition lists to return. Any of 'FAILED',
+      'MATERIALIZING', 'MATERIALIZED', 'MISSING' (case-insensitive).
+      Default: ['FAILED', 'MATERIALIZING']. Counts for all four are always
+      returned.
+    - limit: max partition keys per list (default 1000)
+    - failed_run_limit: for up to this many failed partitions per asset,
+      also return the run that failed them (default 20; 0 turns it off).
+      One call looks up at most 100 partitions in total
+
+    Returns per asset:
+    - asset_key, partitioned, partition_definition
+    - counts: {total, failed, materializing, materialized, missing}
+    - one list of partition keys per requested status (e.g. 'failed'), in
+      partition order
+    - truncated: names of lists cut at `limit` (only when a list was cut)
+    - dimensions: dimension names, only for multi-partitioned assets. Their
+      keys are joined with '|' in dimension-name order (e.g. '2024-01-01|eu')
+    - unresolved_ranges: only when Dagster reported a range whose endpoints
+      are not current partition keys, so its keys could not be listed
+    - failed_runs: {partition, run_id, status} for the first failed
+      partitions, when 'FAILED' is requested. Pass run_id to
+      get_run_failure_summary to see why the partition failed. One run can
+      cover many partitions. If the lookup fails, failed_runs_error has the
+      reason and the partition lists are still complete
+
+    Each partition has exactly one status. A partition that failed and is
+    being retried counts as 'materializing'. 'failed' means the latest
+    attempt failed and no later run has materialized it.
+
+    Unpartitioned or unknown assets return a 'message' instead.
+
+    To re-run failed partitions, pass an asset's 'failed' keys to
+    backfill_assets(asset_keys=[that asset], partition_keys=...). Assets in
+    one backfill must share a partition definition and partition keys, so
+    launch one backfill per asset when their failed partitions differ.
+    """
+    if not asset_keys:
+        raise ValueError("asset_keys must contain at least one asset key.")
+    requested = [status.lower() for status in statuses or ["FAILED", "MATERIALIZING"]]
+    invalid = [status for status in requested if status not in _PARTITION_STATUS_NAMES]
+    if invalid:
+        raise ValueError(
+            "statuses must be any of FAILED, MATERIALIZING, MATERIALIZED, MISSING; "
+            f"got {invalid!r}."
+        )
+    if limit < 0 or failed_run_limit < 0:
+        raise ValueError("limit and failed_run_limit must not be negative.")
+
+    data = gql(
+        _ASSET_PARTITION_STATUS_QUERY,
+        {"assetKeys": [_asset_key_input(key) for key in asset_keys]},
+        env=env,
+    )
+    nodes_by_key: dict[str, dict] = {}
+    for node in data.get("assetNodes") or []:
+        # An asset defined in several code locations appears once per
+        # location; its partition status is stored per asset key, so any copy
+        # gives the same answer.
+        nodes_by_key.setdefault(_asset_node_key(node), node)
+
+    results = []
+    for asset_key in dict.fromkeys(asset_keys):
+        node = nodes_by_key.get(asset_key)
+        if node is None:
+            results.append({"asset_key": asset_key, "message": "Asset not found."})
+            continue
+        if not node.get("isPartitioned"):
+            results.append(
+                {
+                    "asset_key": asset_key,
+                    "partitioned": False,
+                    "message": "Asset is not partitioned; use get_asset_health for its status.",
+                }
+            )
+            continue
+
+        all_keys, by_status, unresolved = _partition_status_lists(node)
+
+        # Dagster can report one key under several statuses; keep the one the
+        # UI shows, in the order MATERIALIZING > FAILED > MATERIALIZED.
+        materializing = list(dict.fromkeys(by_status["materializing"]))
+        claimed = set(materializing)
+        failed = [key for key in dict.fromkeys(by_status["failed"]) if key not in claimed]
+        claimed.update(failed)
+        materialized = [
+            key for key in dict.fromkeys(by_status["materialized"]) if key not in claimed
+        ]
+        claimed.update(materialized)
+        missing = [key for key in all_keys if key not in claimed]
+
+        order = {key: index for index, key in enumerate(all_keys)}
+        lists = {
+            name: sorted(keys, key=lambda key: order.get(key, len(order)))
+            for name, keys in (
+                ("failed", failed),
+                ("materializing", materializing),
+                ("materialized", materialized),
+                ("missing", missing),
+            )
+        }
+
+        entry: dict[str, Any] = {
+            "asset_key": asset_key,
+            "partitioned": True,
+            "partition_definition": (node.get("partitionDefinition") or {}).get("description"),
+            "counts": {"total": len(all_keys)} | {name: len(keys) for name, keys in lists.items()},
+        }
+        dimension_names = [d["name"] for d in node.get("partitionKeysByDimension") or []]
+        if len(dimension_names) > 1:
+            entry["dimensions"] = sorted(dimension_names)
+        truncated = []
+        for name in dict.fromkeys(requested):
+            entry[name] = lists[name][:limit]
+            if len(lists[name]) > limit:
+                truncated.append(name)
+        if truncated:
+            entry["truncated"] = truncated
+        if unresolved:
+            entry["unresolved_ranges"] = unresolved
+        results.append(entry)
+
+    if "failed" in requested and failed_run_limit:
+        _add_failed_partition_runs(results, failed_run_limit, env)
+    return results
+
+
+# Upper bound on latestRunForPartition lookups in one request. Each costs
+# Dagster two storage reads, and the request shares gql's 30 s timeout.
+_FAILED_RUN_LOOKUP_MAX: Final[int] = 100
+
+
+def _add_failed_partition_runs(results: list[dict], per_asset: int, env: str | None) -> None:
+    """Add the latest run of the first failed partitions to each entry, in one request."""
+    targets = []
+    budget = _FAILED_RUN_LOOKUP_MAX
+    for entry in results:
+        if entry.get("failed") and budget > 0:
+            partitions = entry["failed"][: min(per_asset, budget)]
+            budget -= len(partitions)
+            targets.append((entry, partitions))
+    if not targets:
+        return
+    definitions = []
+    fields = []
+    variables: dict[str, Any] = {}
+    for asset_index, (entry, partitions) in enumerate(targets):
+        definitions.append(f"$k{asset_index}: AssetKeyInput!")
+        variables[f"k{asset_index}"] = _asset_key_input(entry["asset_key"])
+        runs = []
+        for partition_index, partition in enumerate(partitions):
+            name = f"a{asset_index}p{partition_index}"
+            definitions.append(f"${name}: String!")
+            variables[name] = partition
+            runs.append(f"{name}: latestRunForPartition(partition: ${name}) {{ runId status }}")
+        fields.append(
+            f"a{asset_index}: assetNodeOrError(assetKey: $k{asset_index}) "
+            "{ __typename ... on AssetNode { " + " ".join(runs) + " } }"
+        )
+    query = (
+        f"query PartitionRuns({', '.join(definitions)}) {{\n  "
+        + "\n  ".join(fields)
+        + "\n}"
+    )
+    try:
+        data = gql(query, variables, env=env)
+    except RuntimeError as exc:
+        for entry, _ in targets:
+            entry["failed_runs_error"] = f"Could not look up the failed runs: {exc}"
+        return
+    for asset_index, (entry, partitions) in enumerate(targets):
+        node = data.get(f"a{asset_index}") or {}
+        failed_runs = []
+        for partition_index, partition in enumerate(partitions):
+            run = node.get(f"a{asset_index}p{partition_index}") or {}
+            failed_runs.append(
+                {"partition": partition, "run_id": run.get("runId"), "status": run.get("status")}
+            )
+        entry["failed_runs"] = failed_runs
+
+
+_ASSET_CHECKS_QUERY: Final[str] = """
+query AssetChecks($assetKeys: [AssetKeyInput!]!) {
+  assetNodes(assetKeys: $assetKeys) {
+    assetKey { path }
+    assetChecksOrError {
+      __typename
+      ... on AssetChecks { checks { name description blocking } }
+      ... on Error { message }
+    }
+  }
+}
+"""
+
+_CHECK_EXECUTION_FRAGMENT: Final[str] = (
+    """
+fragment CheckExecution on AssetCheckExecution {
+  runId
+  status
+  timestamp
+  partition
+  evaluation {
+    severity
+    description
+__METADATA_ENTRIES__
+  }
+}
+"""
+).replace("__METADATA_ENTRIES__", _METADATA_ENTRIES_FRAGMENT)
+
+
+def _check_execution(execution: Mapping[str, Any]) -> dict:
+    evaluation = execution.get("evaluation") or {}
+    result = {
+        "run_id": execution.get("runId"),
+        "status": execution.get("status"),
+        "timestamp": execution.get("timestamp"),
+        "partition": execution.get("partition"),
+    }
+    if evaluation:
+        result["severity"] = evaluation.get("severity")
+        result["description"] = evaluation.get("description")
+        result["metadata"] = _flatten_metadata(evaluation.get("metadataEntries"))
+    return result
+
+
+@mcp.tool()
+def get_asset_check_results(
+    asset_keys: list[str],
+    check_name: str | None = None,
+    limit: int = 1,
+    env: str | None = None,
+) -> list[dict]:
+    """Get the results of the asset checks (data quality checks) defined on assets.
+
+    - asset_keys: one or more asset keys, '/'-separated for nested keys
+    - check_name: only this check (default: every check on each asset)
+    - limit: executions to return per check, newest first (default 1, the
+      latest result only)
+
+    Returns per asset: asset_key and checks, a list with, per check:
+    - check_name, description, blocking (a failed blocking check stops
+      downstream assets in the same run)
+    - status of the latest execution: SUCCEEDED, FAILED (the check ran and
+      found a problem), EXECUTION_FAILED (the check itself raised an
+      error), IN_PROGRESS, SKIPPED, or NOT_RUN (no execution yet)
+    - executions: {run_id, status, timestamp (Unix seconds), partition,
+      severity (ERROR or WARN), description, metadata} per execution
+
+    Assets that are unknown, or whose checks Dagster cannot read, return a
+    'message' instead. To see why a check could not execute, pass its run_id
+    to get_run_failure_summary.
+    """
+    if not asset_keys:
+        raise ValueError("asset_keys must contain at least one asset key.")
+    if limit < 1:
+        raise ValueError("limit must be at least 1.")
+
+    data = gql(
+        _ASSET_CHECKS_QUERY,
+        {"assetKeys": [_asset_key_input(key) for key in asset_keys]},
+        env=env,
+    )
+    nodes_by_key: dict[str, dict] = {}
+    for node in data.get("assetNodes") or []:
+        nodes_by_key.setdefault(_asset_node_key(node), node)
+
+    results: list[dict] = []
+    wanted: list[tuple[dict, str]] = []  # (check entry, asset key)
+    for asset_key in dict.fromkeys(asset_keys):
+        node = nodes_by_key.get(asset_key)
+        if node is None:
+            results.append({"asset_key": asset_key, "message": "Asset not found."})
+            continue
+        checks_or_error = node.get("assetChecksOrError") or {}
+        if checks_or_error.get("__typename") != "AssetChecks":
+            results.append(
+                {
+                    "asset_key": asset_key,
+                    "message": checks_or_error.get("message")
+                    or f"Dagster cannot read asset checks ({checks_or_error.get('__typename')}).",
+                }
+            )
+            continue
+        checks = [
+            {
+                "check_name": check["name"],
+                "description": check.get("description"),
+                "blocking": check.get("blocking"),
+            }
+            for check in checks_or_error.get("checks") or []
+            if check_name is None or check["name"] == check_name
+        ]
+        entry: dict[str, Any] = {"asset_key": asset_key, "checks": checks}
+        if check_name is not None and not checks:
+            entry["message"] = f"Asset has no check named {check_name!r}."
+        results.append(entry)
+        wanted.extend((check, asset_key) for check in checks)
+
+    if not wanted:
+        return results
+
+    definitions = ["$limit: Int!"]
+    fields = []
+    variables: dict[str, Any] = {"limit": limit}
+    for index, (check, asset_key) in enumerate(wanted):
+        definitions += [f"$k{index}: AssetKeyInput!", f"$c{index}: String!"]
+        variables[f"k{index}"] = _asset_key_input(asset_key)
+        variables[f"c{index}"] = check["check_name"]
+        fields.append(
+            f"e{index}: assetCheckExecutions(assetKey: $k{index}, checkName: $c{index}, "
+            "limit: $limit) { ...CheckExecution }"
+        )
+    query = (
+        f"query AssetCheckExecutions({', '.join(definitions)}) {{\n  "
+        + "\n  ".join(fields)
+        + "\n}"
+        + _CHECK_EXECUTION_FRAGMENT
+    )
+    executions = gql(query, variables, env=env)
+    for index, (check, _) in enumerate(wanted):
+        history = [_check_execution(e) for e in executions.get(f"e{index}") or []]
+        check["status"] = history[0]["status"] if history else "NOT_RUN"
+        check["executions"] = history
+    return results
+
+
+# ── Automation ────────────────────────────────────────────────────────────────
+
+# Sensors of these types evaluate automation conditions. Dagster's own
+# default_automation_condition_sensor reports AUTO_MATERIALIZE.
+_AUTOMATION_SENSOR_TYPES: Final[frozenset[str]] = frozenset({"AUTOMATION", "AUTO_MATERIALIZE"})
+_CONDITION_LABEL_MAX: Final[int] = 300
+_SINCE_TIMES: Final = (("last trigger", "triggerTimestamp"), ("last reset", "resetTimestamp"))
+
+_ASSET_AUTOMATION_QUERY: Final[str] = """
+query AssetAutomation($assetKey: AssetKeyInput!, $limit: Int!) {
+  assetNodeOrError(assetKey: $assetKey) {
+    __typename
+    ... on AssetNode {
+      isPartitioned
+      automationCondition { label expandedLabel }
+      currentAutoMaterializeEvaluationId
+      targetingInstigators {
+        __typename
+        ... on Sensor {
+          name
+          sensorType
+          sensorState {
+            status
+            ticks(limit: 1) { status timestamp skipReason error { message } }
+          }
+        }
+        ... on Schedule {
+          name
+          cronSchedule
+          executionTimezone
+          scheduleState { status }
+        }
+      }
+    }
+    ... on AssetNotFoundError { message }
+  }
+  assetConditionEvaluationRecordsOrError(assetKey: $assetKey, limit: $limit) {
+    __typename
+    ... on AssetConditionEvaluationRecords {
+      records {
+        evaluationId
+        timestamp
+        numRequested
+        runIds
+        rootUniqueId
+        evaluationNodes {
+          uniqueId
+          userLabel
+          expandedLabel
+          numTrue
+          numCandidates
+          isPartitioned
+          childUniqueIds
+          operatorType
+          sinceMetadata { triggerTimestamp resetTimestamp }
+        }
+      }
+    }
+    ... on AutoMaterializeAssetEvaluationNeedsMigrationError { message }
+  }
+  instance {
+    autoMaterializePaused
+    useAutoMaterializeSensors
+    daemonHealth { allDaemonStatuses { daemonType required healthy } }
+  }
+}
+"""
+
+
+def _iso_utc(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _condition_label(node: Mapping[str, Any]) -> str:
+    label = node.get("userLabel") or " ".join(node.get("expandedLabel") or []) or "?"
+    if len(label) > _CONDITION_LABEL_MAX:
+        label = label[: _CONDITION_LABEL_MAX - 3] + "..."
+    return label
+
+
+def _condition_state(node: Mapping[str, Any]) -> str:
+    """TRUE, FALSE, or SKIPPED (not evaluated); for partitions, 'TRUE for n [of m] partitions'."""
+    true = node.get("numTrue") or 0
+    candidates = node.get("numCandidates")
+    if candidates == 0:
+        return "SKIPPED"
+    if not true:
+        return "FALSE"
+    if not node.get("isPartitioned"):
+        return "TRUE"
+    of = f" of {candidates}" if candidates is not None else ""
+    return f"TRUE for {true}{of} partition{'' if (candidates or true) == 1 else 's'}"
+
+
+def _condition_tree(nodes: Mapping[str, Mapping[str, Any]], root_id: str) -> list[str]:
+    """Render an evaluation as indented lines: '<state>  <condition>'."""
+    lines: list[str] = []
+
+    def walk(node_id: str, depth: int, path: frozenset[str]) -> None:
+        node = nodes.get(node_id)
+        if node is None or node_id in path:
+            return
+        line = f"{'  ' * depth}{_condition_state(node)}  {_condition_label(node)}"
+        since = node.get("sinceMetadata") or {}
+        times = [
+            f"{name} {_iso_utc(since[key])}"
+            for name, key in _SINCE_TIMES
+            if since.get(key)
+        ]
+        if times:
+            line += f"  [{', '.join(times)}]"
+        lines.append(line)
+        for child in node.get("childUniqueIds") or []:
+            walk(child, depth + 1, path | {node_id})
+
+    walk(root_id, 0, frozenset())
+    return lines
+
+
+def _blocking_conditions(
+    nodes: Mapping[str, Mapping[str, Any]], node_id: str, path: frozenset[str] = frozenset()
+) -> list[str]:
+    """Name the conditions that kept a false condition from being true.
+
+    For AND, the false children. For OR, the blockers of every branch, because
+    all branches were false. Other conditions, such as NOT and SINCE, name
+    themselves.
+    """
+    node = nodes.get(node_id)
+    if node is None or node_id in path or node.get("numTrue") or node.get("numCandidates") == 0:
+        return []
+    child_ids = [child for child in node.get("childUniqueIds") or [] if child in nodes]
+    if node.get("operatorType") in ("and", "or"):
+        found = [
+            label
+            for child in child_ids
+            for label in _blocking_conditions(nodes, child, path | {node_id})
+        ]
+        if found:
+            return found
+        if node.get("operatorType") == "and":
+            # Each child was true for some partitions, but never all for the same one.
+            partial = [
+                f"{_condition_label(nodes[child])} ({_condition_state(nodes[child])})"
+                for child in child_ids
+                if nodes[child].get("numCandidates") is not None
+                and (nodes[child].get("numTrue") or 0) < nodes[child]["numCandidates"]
+            ]
+            if partial:
+                return partial
+    return [_condition_label(node)]
+
+
+def _evaluation_summary(record: Mapping[str, Any]) -> dict:
+    nodes = {node["uniqueId"]: node for node in record.get("evaluationNodes") or []}
+    root = nodes.get(record.get("rootUniqueId") or "")
+    return {
+        "evaluation_id": record.get("evaluationId"),
+        "timestamp": record.get("timestamp"),
+        "result": _condition_state(root) if root else None,
+        "requested": record.get("numRequested") or 0,
+        "run_ids": record.get("runIds") or [],
+    }
+
+
+@mcp.tool()
+def get_asset_automation(asset_key: str, limit: int = 5, env: str | None = None) -> dict:
+    """Explain whether and why Dagster's automation starts runs for an asset.
+
+    Use this when an asset with an automation condition (for example eager or
+    on_cron) did not run, or ran when you did not expect it.
+
+    Parameters:
+    - asset_key: '/'-separated for nested keys
+    - limit: evaluation records to return, newest first (default 5, max 50)
+
+    Returns:
+    - automation_condition: the condition's label, or None
+    - automation_sensors: the sensors that evaluate the condition, with
+      status and last tick {status, timestamp, skip_reason, error}
+    - other_instigators: schedules and other sensors that target the asset
+    - issues: problems that stop automation, for example a stopped sensor
+    - latest_evaluation: the newest record, with:
+      - requested: runs or partitions requested; run_ids
+      - blocking_conditions: the false conditions that stopped a request
+      - condition_tree: one line per condition, '<state>  <condition>',
+        indented by nesting. The state is TRUE, FALSE, or SKIPPED (Dagster
+        did not evaluate it, because an earlier condition was false). For a
+        partitioned asset, TRUE says for how many partitions.
+    - history: {evaluation_id, timestamp, result, requested, run_ids} per record
+
+    Dagster stores a record only when the result changes or it requests a
+    run, and deletes records after 30 days. A record that is older than the
+    last sensor tick is still the current state. Timestamps are Unix
+    seconds; the tree uses UTC.
+    """
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be from 1 to 50.")
+    data = gql(
+        _ASSET_AUTOMATION_QUERY,
+        {"assetKey": _asset_key_input(asset_key), "limit": limit},
+        env=env,
+    )
+    node = data.get("assetNodeOrError") or {}
+    if node.get("__typename") != "AssetNode":
+        raise RuntimeError(node.get("message") or f"Asset {asset_key!r} not found.")
+
+    condition = node.get("automationCondition")
+    automation_sensors = []
+    other_instigators = []
+    for instigator in node.get("targetingInstigators") or []:
+        if instigator.get("__typename") == "Sensor":
+            state = instigator.get("sensorState") or {}
+            tick = (state.get("ticks") or [None])[0]
+            sensor = {
+                "name": instigator.get("name"),
+                "type": instigator.get("sensorType"),
+                "status": state.get("status"),
+            }
+            if instigator.get("sensorType") in _AUTOMATION_SENSOR_TYPES:
+                sensor["last_tick"] = tick and {
+                    "status": tick.get("status"),
+                    "timestamp": tick.get("timestamp"),
+                    "skip_reason": tick.get("skipReason"),
+                    "error": (tick.get("error") or {}).get("message"),
+                }
+                automation_sensors.append(sensor)
+            else:
+                other_instigators.append({"kind": "sensor", **sensor})
+        elif instigator.get("__typename") == "Schedule":
+            other_instigators.append(
+                {
+                    "kind": "schedule",
+                    "name": instigator.get("name"),
+                    "cron": instigator.get("cronSchedule"),
+                    "timezone": instigator.get("executionTimezone"),
+                    "status": (instigator.get("scheduleState") or {}).get("status"),
+                }
+            )
+
+    result: dict[str, Any] = {
+        "asset_key": asset_key,
+        "automation_condition": condition.get("label")
+        or " ".join(condition.get("expandedLabel") or [])
+        if condition
+        else None,
+        "automation_sensors": automation_sensors,
+        "other_instigators": other_instigators,
+    }
+    issues: list[str] = []
+    if not condition:
+        issues.append(
+            "The asset has no automation condition, so automation does not start runs for it."
+        )
+        result["issues"] = issues
+        return result
+
+    instance = data.get("instance") or {}
+    # AUTO_MATERIALIZE sensors and the legacy daemon run in the ASSET daemon;
+    # AUTOMATION sensors run in user code, through the SENSOR daemon.
+    daemon_types: set[str] = set()
+    if instance.get("useAutoMaterializeSensors", True):
+        if not automation_sensors:
+            issues.append("No automation sensor targets this asset.")
+        for sensor in automation_sensors:
+            daemon_types.add("SENSOR" if sensor["type"] == "AUTOMATION" else "ASSET")
+            if sensor["status"] != "RUNNING":
+                issues.append(
+                    f"Automation sensor {sensor['name']!r} is {sensor['status']}, so Dagster "
+                    "does not evaluate this asset's condition."
+                )
+            tick = sensor.get("last_tick") or {}
+            if tick.get("status") == "FAILURE":
+                error = tick.get("error") or "no message"
+                issues.append(f"The last tick of {sensor['name']!r} failed: {error}")
+    else:
+        daemon_types.add("ASSET")
+        if instance.get("autoMaterializePaused"):
+            issues.append("Auto-materialization is paused on this instance.")
+    daemons = (instance.get("daemonHealth") or {}).get("allDaemonStatuses") or []
+    for daemon in daemons:
+        daemon_type = daemon.get("daemonType")
+        if daemon_type in daemon_types and daemon.get("required") and not daemon.get("healthy"):
+            issues.append(
+                f"The {daemon_type} daemon, which evaluates this asset's automation, is not "
+                "healthy. Check get_instance_status."
+            )
+
+    records_or_error = data.get("assetConditionEvaluationRecordsOrError") or {}
+    records = records_or_error.get("records") or []
+    if records_or_error.get("__typename") not in (None, "AssetConditionEvaluationRecords"):
+        issues.append(records_or_error.get("message") or "Dagster cannot read evaluations.")
+    elif not records:
+        evaluated = node.get("currentAutoMaterializeEvaluationId") is not None or any(
+            sensor.get("last_tick") for sensor in automation_sensors
+        )
+        if evaluated:
+            # The asset daemon deletes records after 30 days (EVALUATIONS_TTL_DAYS).
+            result["note"] = (
+                "There is no evaluation record from the last 30 days. Dagster stores a record "
+                "only when the result changes, and deletes records after 30 days. So the "
+                "result did not change in that time, or the asset is new and Dagster did not "
+                "evaluate it yet."
+            )
+        else:
+            issues.append("Dagster has not evaluated this asset yet.")
+
+    result["issues"] = issues
+    result["latest_evaluation"] = None
+    result["history"] = [_evaluation_summary(record) for record in records]
+    if records:
+        latest = records[0]
+        nodes = {n["uniqueId"]: n for n in latest.get("evaluationNodes") or []}
+        root_id = latest.get("rootUniqueId") or ""
+        entry = result["history"][0].copy()
+        if not entry["requested"]:
+            entry["blocking_conditions"] = _blocking_conditions(nodes, root_id)
+        entry["condition_tree"] = _condition_tree(nodes, root_id)
+        current = node.get("currentAutoMaterializeEvaluationId")
+        try:
+            newer = current is not None and int(current) > int(latest.get("evaluationId"))
+        except (TypeError, ValueError):
+            newer = False
+        if newer:
+            entry["note"] = (
+                f"Dagster evaluated the asset again up to evaluation {current}. Those "
+                "evaluations stored no record, so their result was the same."
+            )
+        result["latest_evaluation"] = entry
+    return result
 
 
 # ── Jobs & Schedules & Sensors ────────────────────────────────────────────────
@@ -1254,7 +2680,7 @@ query ListJobs {
 
 # Rides along in the same request as repositoriesOrError so a failed or
 # still-loading code location can be told apart from "no such repository"
-# at no extra round-trip. Identical shape at Dagster 1.7.16 and 1.13.15.
+# at no extra round-trip.
 _WORKSPACE_LOAD_STATUS_SELECTION: Final[str] = """  workspaceOrError {
     __typename
     ... on Workspace {
@@ -2446,15 +3872,19 @@ def get_instance_status(env: str | None = None) -> dict:
     - healthy: boolean — true only if all required daemons are healthy AND
       no code locations have errors
     - daemons: list of {type, healthy, last_heartbeat, required} for each daemon
-      (scheduler, sensor, run coordinator, etc.)
+      (scheduler, sensor, run coordinator, backfill, etc.)
     - queued_runs_count: number of runs waiting in queue (high count = bottleneck)
-    - queued_runs_count_capped: true when the count is a floor rather than exact,
-      which happens only on Dagster versions that do not report a total
+    - max_concurrent_runs: the run queue's limit on runs in progress, or
+      null when there is no limit
+    - pools: per concurrency pool, {pool, limit, in_use, waiting_steps}.
+      A pool with waiting steps and no free slots holds runs back even when
+      the run queue has room
     - code_location_errors: list of {name, error} for locations that failed to load
 
     When to use: as the FIRST call in any diagnostic or monitoring flow.
     If healthy=false, check daemons for unhealthy entries and
-    code_location_errors for loading failures.
+    code_location_errors for loading failures. If runs stay queued, compare
+    queued_runs_count with max_concurrent_runs and check pools.
     Follow up with list_code_locations or get_runs as needed.
     """
     query = """
@@ -2468,12 +3898,16 @@ def get_instance_status(env: str | None = None) -> dict:
             lastHeartbeatTime
           }
         }
-      }
-      runsOrError(filter: {statuses: [QUEUED]}, limit: 100) {
-        ... on Runs {
-          count
-          results { runId }
+        runQueueConfig { maxConcurrentRuns }
+        concurrencyLimits {
+          concurrencyKey
+          slotCount
+          activeSlotCount
+          pendingStepCount
         }
+      }
+      runsOrError(filter: {statuses: [QUEUED]}, limit: 1) {
+        ... on Runs { count }
         ... on PythonError { message }
       }
       workspaceOrError {
@@ -2490,9 +3924,8 @@ def get_instance_status(env: str | None = None) -> dict:
     }
     """
     data = gql(query, env=env)
+    instance = data.get("instance") or {}
 
-    # Daemons
-    daemon_statuses = data.get("instance", {}).get("daemonHealth", {}).get("allDaemonStatuses", [])
     daemons = [
         {
             "type": d["daemonType"],
@@ -2500,39 +3933,44 @@ def get_instance_status(env: str | None = None) -> dict:
             "last_heartbeat": d.get("lastHeartbeatTime"),
             "required": d["required"],
         }
-        for d in daemon_statuses
+        for d in (instance.get("daemonHealth") or {}).get("allDaemonStatuses", [])
     ]
 
-    # Queued runs
-    runs_or_error = data.get("runsOrError", {})
-    queued_runs = runs_or_error.get("results", [])
-    # Runs.count is the true total for the filter. It is nullable on older
-    # Dagster, so fall back to the page length and flag that it is a floor
-    # rather than reporting a saturated 100 as if it were exact.
-    reported_count = runs_or_error.get("count")
-    if isinstance(reported_count, int):
-        queued_count = reported_count
-        queued_count_capped = False
-    else:
-        queued_count = len(queued_runs)
-        queued_count_capped = len(queued_runs) >= _QUEUED_RUNS_PAGE_LIMIT
+    runs_or_error = data.get("runsOrError") or {}
+    if "count" not in runs_or_error:
+        raise RuntimeError(
+            "Dagster could not count queued runs: "
+            f"{runs_or_error.get('message', 'unknown error')}"
+        )
 
-    # Code location errors
-    location_entries = data.get("workspaceOrError", {}).get("locationEntries", [])
+    pools = [
+        {
+            "pool": pool["concurrencyKey"],
+            "limit": pool["slotCount"],
+            "in_use": pool["activeSlotCount"],
+            "waiting_steps": pool["pendingStepCount"],
+        }
+        for pool in instance.get("concurrencyLimits") or []
+    ]
+
+    location_entries = (data.get("workspaceOrError") or {}).get("locationEntries", [])
     code_location_errors = []
     for loc in location_entries:
-        err = loc.get("locationOrLoadError", {})
+        err = loc.get("locationOrLoadError") or {}
         if "message" in err:
             code_location_errors.append({"name": loc["name"], "error": err["message"]})
 
     all_required_healthy = all(d["healthy"] for d in daemons if d["required"])
     healthy = all_required_healthy and len(code_location_errors) == 0
+    # Dagster uses -1 for "no limit".
+    max_runs = (instance.get("runQueueConfig") or {}).get("maxConcurrentRuns")
 
     return {
         "healthy": healthy,
         "daemons": daemons,
-        "queued_runs_count": queued_count,
-        "queued_runs_count_capped": queued_count_capped,
+        "queued_runs_count": runs_or_error["count"],
+        "max_concurrent_runs": max_runs if max_runs is not None and max_runs >= 0 else None,
+        "pools": pools,
         "code_location_errors": code_location_errors,
     }
 
@@ -2573,47 +4011,266 @@ def reload_code_location(location_name: str, env: str | None = None) -> dict:
 # ── Backfills ─────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
-def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
-    """List recent asset backfills with their status and partition progress.
+_BACKFILL_SUMMARY_FIELDS: Final[str] = """
+    backfillId: id
+    status
+    isAssetBackfill
+    title
+    assetSelection { path }
+    jobName
+    partitionSetName
+    numPartitions
+    fromFailure
+    timestamp
+    endTimestamp
+    error { message }"""
 
-    Returns per backfill: backfillId, status, numPartitions, timestamp,
-    partitionNames, and partitionSetName.
+
+def _backfill_summary(backfill: Mapping[str, Any]) -> dict:
+    summary = dict(backfill)
+    summary["assetSelection"] = [
+        "/".join(key["path"]) for key in backfill.get("assetSelection") or []
+    ]
+    summary["error"] = (backfill.get("error") or {}).get("message")
+    return summary
+
+
+@mcp.tool()
+def list_backfills(
+    limit: int = 10,
+    env: str | None = None,
+    statuses: list[str] | None = None,
+    created_after: str | float | None = None,
+    created_before: str | float | None = None,
+    cursor: str | None = None,
+) -> list[dict]:
+    """List recent backfills, newest first, with their status.
+
+    Returns per backfill: backfillId, status, isAssetBackfill, title,
+    assetSelection (asset keys of an asset backfill), jobName and
+    partitionSetName (of a job backfill), numPartitions, fromFailure,
+    timestamp and endTimestamp (Unix seconds), and error (message, if it
+    failed).
 
     - limit: max backfills to return (default 10)
+    - statuses: only backfills with these statuses: REQUESTED (in
+      progress), COMPLETED_SUCCESS, COMPLETED_FAILED, FAILING, FAILED,
+      CANCELING, CANCELED
+    - created_after / created_before: ISO 8601 strings or Unix seconds
+    - cursor: the backfillId of the last backfill of the previous page
 
     When to use: to monitor in-progress backfills or review recent ones.
+    Use get_backfill for which assets, partitions, and runs failed.
     """
-    query = """
-    query Backfills($limit: Int!, $cursor: String) {
-      partitionBackfillsOrError(cursor: $cursor, limit: $limit) {
+    query = (
+        """
+    query Backfills($limit: Int!, $cursor: String, $filters: BulkActionsFilter) {
+      partitionBackfillsOrError(cursor: $cursor, limit: $limit, filters: $filters) {
+        __typename
         ... on PartitionBackfills {
           results {
-            backfillId: id
-            status
-            numPartitions
-            timestamp
-            partitionNames
-            partitionSetName
+__FIELDS__
           }
         }
         ... on PythonError { message }
       }
     }
     """
-    data = gql(query, {"limit": limit}, env=env)
-    return data.get("partitionBackfillsOrError", {}).get("results", [])
+    ).replace("__FIELDS__", _BACKFILL_SUMMARY_FIELDS)
+    filters: dict[str, Any] = {}
+    if statuses:
+        filters["statuses"] = [status.upper() for status in statuses]
+    for name, field, value in (
+        ("created_after", "createdAfter", created_after),
+        ("created_before", "createdBefore", created_before),
+    ):
+        timestamp = _timestamp_input(value, name)
+        if timestamp is not None:
+            filters[field] = timestamp
+    data = gql(
+        query,
+        {"limit": limit, "cursor": cursor, "filters": filters or None},
+        env=env,
+    )
+    backfills = data.get("partitionBackfillsOrError") or {}
+    if backfills.get("__typename") not in (None, "PartitionBackfills"):
+        raise RuntimeError(
+            f"Dagster could not list backfills: {backfills.get('message', 'unknown error')}"
+        )
+    return [_backfill_summary(b) for b in backfills.get("results") or []]
+
+
+_GET_BACKFILL_QUERY: Final[str] = (
+    """
+query Backfill($backfillId: String!, $runFilter: RunsFilter!, $runLimit: Int!) {
+  partitionBackfillOrError(backfillId: $backfillId) {
+    __typename
+    ... on PartitionBackfill {
+__FIELDS__
+      description
+      user
+      tags { key value }
+      error { message className stack causes { message className stack } }
+      assetBackfillData {
+        assetBackfillStatuses {
+          __typename
+          ... on AssetPartitionsStatusCounts {
+            assetKey { path }
+            numPartitionsTargeted
+            numPartitionsInProgress
+            numPartitionsMaterialized
+            numPartitionsFailed
+          }
+          ... on UnpartitionedAssetStatus {
+            assetKey { path }
+            inProgress
+            materialized
+            failed
+          }
+        }
+        rootTargetedPartitions {
+          partitionKeys
+          ranges { start end }
+        }
+      }
+      partitionStatuses {
+        results { partitionName runId runStatus }
+      }
+    }
+    ... on BackfillNotFoundError { message }
+    ... on PythonError { message }
+  }
+  runsOrError(filter: $runFilter, limit: $runLimit) {
+    __typename
+    ... on Runs {
+      count
+      results { runId status startTime endTime tags { key value } }
+    }
+    ... on PythonError { message }
+  }
+}
+"""
+).replace("__FIELDS__", _BACKFILL_SUMMARY_FIELDS)
+
+# Partition keys returned per list by get_backfill before it truncates.
+_BACKFILL_PARTITION_LIST_LIMIT: Final[int] = 200
+
+
+def _capped(keys: Sequence[str], limit: int = _BACKFILL_PARTITION_LIST_LIMIT) -> dict:
+    result: dict[str, Any] = {"count": len(keys), "keys": list(keys[:limit])}
+    if len(keys) > limit:
+        result["truncated"] = True
+    return result
+
+
+@mcp.tool()
+def get_backfill(backfill_id: str, run_limit: int = 20, env: str | None = None) -> dict:
+    """Get one backfill in detail: status, error, per-asset progress, and its failed runs.
+
+    - backfill_id: the backfill id (from list_backfills, backfill_assets, or
+      launch_job_with_partitions)
+    - run_limit: max failed or canceled runs to list (default 20)
+
+    Returns the fields of list_backfills, plus:
+    - error: message, class, stack trace, and causes when the backfill
+      itself failed
+    - assets (asset backfills): per asset, partitions targeted,
+      materialized, failed, and in progress; or materialized / failed /
+      in_progress flags for unpartitioned assets
+    - targeted_partitions (asset backfills): the partition keys or ranges
+      the backfill was asked to run
+    - partitions (job backfills): partition keys grouped by the status of
+      their run, e.g. {'FAILURE': {count, keys}, 'SUCCESS': {...}}
+    - failed_runs: {run_id, status, partition or partition range} for the
+      backfill's failed and canceled runs; failed_runs_total is the full count
+    - tags, description, user
+
+    When to use: after a backfill reports COMPLETED_FAILED or FAILED, to find
+    which assets and partitions failed and which runs to inspect with
+    get_run_failure_summary. To re-run only what failed, use retry_backfill.
+    """
+    data = gql(
+        _GET_BACKFILL_QUERY,
+        {
+            "backfillId": backfill_id,
+            "runFilter": {
+                "tags": [{"key": _BACKFILL_TAG, "value": backfill_id}],
+                "statuses": ["FAILURE", "CANCELED"],
+            },
+            "runLimit": run_limit,
+        },
+        env=env,
+    )
+    backfill = data.get("partitionBackfillOrError") or {}
+    if backfill.get("__typename") != "PartitionBackfill":
+        return {
+            "backfill_id": backfill_id,
+            "message": backfill.get("message", "Backfill not found."),
+        }
+
+    result = _backfill_summary(backfill)
+    result.pop("__typename", None)
+    result["error"] = _trim_error(backfill.get("error")) or None
+    result["tags"] = {tag["key"]: tag["value"] for tag in backfill.get("tags") or []}
+    for key in ("description", "user"):
+        result[key] = backfill.get(key)
+    result.pop("assetBackfillData", None)
+    result.pop("partitionStatuses", None)
+
+    asset_data = backfill.get("assetBackfillData") or {}
+    if asset_data:
+        assets = []
+        for status in asset_data.get("assetBackfillStatuses") or []:
+            key = "/".join(status["assetKey"]["path"])
+            if status.get("__typename") == "AssetPartitionsStatusCounts":
+                assets.append(
+                    {
+                        "asset_key": key,
+                        "targeted": status["numPartitionsTargeted"],
+                        "materialized": status["numPartitionsMaterialized"],
+                        "failed": status["numPartitionsFailed"],
+                        "in_progress": status["numPartitionsInProgress"],
+                    }
+                )
+            else:
+                assets.append(
+                    {
+                        "asset_key": key,
+                        "materialized": status.get("materialized"),
+                        "failed": status.get("failed"),
+                        "in_progress": status.get("inProgress"),
+                    }
+                )
+        result["assets"] = assets
+        targeted = asset_data.get("rootTargetedPartitions") or {}
+        if targeted.get("partitionKeys"):
+            result["targeted_partitions"] = _capped(targeted["partitionKeys"])
+        elif targeted.get("ranges"):
+            result["targeted_partitions"] = {"ranges": targeted["ranges"]}
+
+    statuses = (backfill.get("partitionStatuses") or {}).get("results")
+    if statuses:
+        by_status: dict[str, list[str]] = {}
+        for partition in statuses:
+            by_status.setdefault(partition.get("runStatus") or "NOT_STARTED", []).append(
+                partition["partitionName"]
+            )
+        result["partitions"] = {status: _capped(keys) for status, keys in by_status.items()}
+
+    runs = data.get("runsOrError") or {}
+    if runs.get("__typename") not in (None, "Runs"):
+        result["failed_runs"] = None
+        result["failed_runs_error"] = runs.get("message", "Dagster could not list the runs.")
+        return result
+    result["failed_runs"] = [
+        {"run_id": run["runId"], "status": run["status"], **(_run_partition(run) or {})}
+        for run in runs.get("results") or []
+    ]
+    result["failed_runs_total"] = runs.get("count")
+    return result
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
-
-
-def _asset_key_input(asset_key: str) -> dict:
-    return {"path": asset_key.split("/")}
-
-
-def _asset_node_key(node: dict) -> str:
-    return "/".join(node.get("assetKey", {}).get("path", []))
 
 
 def _get_materialization_asset_nodes(
@@ -2732,14 +4389,6 @@ def materialize_assets(
                 + ". Use resolve_asset_selection first."
             )
         }
-
-    compatibility_error = _dagster_19_compatibility_error(
-        "materialize_assets",
-        _MATERIALIZE_ASSETS_SCHEMA,
-        env=env,
-    )
-    if compatibility_error:
-        return compatibility_error
 
     requested_keys = sorted(set(asset_keys))
     launched_key_set = set(requested_keys)
@@ -3196,21 +4845,6 @@ def backfill_assets(
     Returns {'backfillId': ...} on success or {'message': <error>} on failure.
     Monitor with list_backfills; runs carry the dagster/backfill tag.
     """
-    if run_config is not None:
-        input_fields = _get_type_fields(
-            "LaunchBackfillParams",
-            env=env,
-            input_type=True,
-        )
-        if "runConfigData" not in input_fields:
-            return {
-                "message": (
-                    "This Dagster instance does not expose "
-                    "LaunchBackfillParams.runConfigData, so configured asset "
-                    "backfills are not supported by its GraphQL API."
-                )
-            }
-
     if partition_keys is None:
         query = """
         query AssetPartitionKeys($assetKeys: [AssetKeyInput!]!) {
@@ -3295,6 +4929,303 @@ def backfill_assets(
     )
 
 
+# ── Backfill and run retries (write) ─────────────────────────────────────────
+
+_BACKFILL_STATUS_QUERY: Final[str] = """
+query BackfillStatus($backfillId: String!) {
+  partitionBackfillOrError(backfillId: $backfillId) {
+    __typename
+    ... on PartitionBackfill { id status isAssetBackfill }
+    ... on BackfillNotFoundError { message }
+    ... on PythonError { message }
+  }
+}
+"""
+
+# A backfill in one of these statuses is finished; Dagster calls them terminal.
+_BACKFILL_TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
+    {"COMPLETED", "COMPLETED_SUCCESS", "COMPLETED_FAILED", "FAILED", "CANCELED"}
+)
+
+
+def _backfill_state(backfill_id: str, env: str | None) -> tuple[dict, str | None]:
+    """Return ({status, isAssetBackfill}, None), or ({}, message) when it cannot be found."""
+    backfill = gql(_BACKFILL_STATUS_QUERY, {"backfillId": backfill_id}, env=env).get(
+        "partitionBackfillOrError"
+    ) or {}
+    if backfill.get("__typename") != "PartitionBackfill":
+        return {}, backfill.get("message") or f"Backfill {backfill_id!r} not found."
+    return backfill, None
+
+
+def _backfill_status(backfill_id: str, env: str | None) -> tuple[str | None, str | None]:
+    """Return (status, None) for a backfill, or (None, message) when it cannot be found."""
+    backfill, error = _backfill_state(backfill_id, env)
+    return backfill.get("status"), error
+
+
+def _backfill_mutation(
+    mutation: str, field: str, success_type: str, backfill_id: str, env: str | None
+) -> str | None:
+    """Run a cancel or resume mutation; return an error message, or None on success."""
+    result = gql(mutation, {"backfillId": backfill_id}, env=env).get(field) or {}
+    if result.get("__typename") == success_type:
+        return None
+    return result.get("message") or f"Dagster returned {result.get('__typename')!r}."
+
+
+def cancel_backfill(backfill_id: str, env: str | None = None) -> dict:
+    """Cancel an in-progress backfill: launch no more runs and stop the ones in progress.
+
+    - backfill_id: the backfill to cancel (from list_backfills)
+
+    Returns {backfill_id, previous_status, status: 'CANCELING'} on success.
+    The backfill daemon then terminates its in-progress runs and moves the
+    backfill to CANCELED. Partitions that already materialized stay
+    materialized.
+
+    Refuses, and changes nothing, when the backfill already finished
+    (COMPLETED_SUCCESS, COMPLETED_FAILED, FAILED, CANCELED) or is already
+    stopping (CANCELING, or FAILING: Dagster is canceling its runs and will
+    mark it FAILED). Dagster itself would mark even a finished backfill as
+    canceling.
+    """
+    status, error = _backfill_status(backfill_id, env)
+    if error is not None:
+        return {"backfill_id": backfill_id, "message": error}
+    if status in _BACKFILL_TERMINAL_STATUSES or status in ("CANCELING", "FAILING"):
+        return {
+            "backfill_id": backfill_id,
+            "status": status,
+            "message": f"Backfill is {status}; there is nothing to cancel. No change was made.",
+        }
+    error = _backfill_mutation(
+        """
+        mutation CancelBackfill($backfillId: String!) {
+          cancelPartitionBackfill(backfillId: $backfillId) {
+            __typename
+            ... on CancelBackfillSuccess { backfillId }
+            ... on Error { message }
+          }
+        }
+        """,
+        "cancelPartitionBackfill",
+        "CancelBackfillSuccess",
+        backfill_id,
+        env,
+    )
+    if error is not None:
+        return {"backfill_id": backfill_id, "status": status, "message": error}
+    return {
+        "backfill_id": backfill_id,
+        "previous_status": status,
+        "status": "CANCELING",
+        "message": "Cancel requested. Runs in progress will be terminated.",
+    }
+
+
+def resume_backfill(backfill_id: str, env: str | None = None) -> dict:
+    """Resume a backfill that FAILED because Dagster hit an error while running it.
+
+    - backfill_id: the backfill to resume (from list_backfills)
+
+    A backfill has status FAILED when the backfill daemon itself failed,
+    for example on a code location error. Resume sets it back to REQUESTED
+    so the daemon continues where it stopped. Returns {backfill_id,
+    previous_status, status: 'REQUESTED'} on success.
+
+    Refuses, and changes nothing, for any status other than FAILED. To run
+    the failed partitions of a COMPLETED_FAILED backfill again, use
+    retry_backfill.
+    """
+    status, error = _backfill_status(backfill_id, env)
+    if error is not None:
+        return {"backfill_id": backfill_id, "message": error}
+    if status != "FAILED":
+        return {
+            "backfill_id": backfill_id,
+            "status": status,
+            "message": (
+                f"Only a FAILED backfill can be resumed; this one is {status}. "
+                "No change was made. Use retry_backfill to re-run failed partitions."
+            ),
+        }
+    error = _backfill_mutation(
+        """
+        mutation ResumeBackfill($backfillId: String!) {
+          resumePartitionBackfill(backfillId: $backfillId) {
+            __typename
+            ... on ResumeBackfillSuccess { backfillId }
+            ... on Error { message }
+          }
+        }
+        """,
+        "resumePartitionBackfill",
+        "ResumeBackfillSuccess",
+        backfill_id,
+        env,
+    )
+    if error is not None:
+        return {"backfill_id": backfill_id, "status": status, "message": error}
+    return {
+        "backfill_id": backfill_id,
+        "previous_status": status,
+        "status": "REQUESTED",
+        "message": "Backfill resumed.",
+    }
+
+
+def retry_backfill(backfill_id: str, from_failure: bool = True, env: str | None = None) -> dict:
+    """Launch a new backfill that re-runs what a finished backfill did not complete.
+
+    - backfill_id: the finished backfill to retry (from list_backfills)
+    - from_failure: True (default) re-runs what did not succeed. False
+      re-runs every partition of the original backfill.
+      - Asset backfill: re-runs every partition that did not materialize:
+        failed, canceled, and never launched. Dagster refuses when nothing
+        is left to run.
+      - Job backfill: re-runs only partitions whose last run FAILED, from
+        the failed step. Canceled and never-launched partitions are skipped,
+        and Dagster does not refuse when there are none; the result then
+        carries a 'note'. Use launch_job_with_partitions for those
+        partitions.
+
+    Returns {backfillId} of the NEW backfill. It keeps the tags of the
+    original and adds 'dagster/parent_backfill_id'. Monitor it with
+    get_backfill.
+
+    Refuses, and changes nothing, unless the original backfill is finished
+    (COMPLETED_SUCCESS, COMPLETED_FAILED, FAILED, or CANCELED).
+    """
+    backfill, error = _backfill_state(backfill_id, env)
+    if error is not None:
+        return {"backfill_id": backfill_id, "message": error}
+    status = backfill.get("status")
+    if status not in _BACKFILL_TERMINAL_STATUSES:
+        return {
+            "backfill_id": backfill_id,
+            "status": status,
+            "message": (
+                f"Backfill is {status}; only a finished backfill can be retried. "
+                "No change was made."
+            ),
+        }
+    mutation = """
+    mutation RetryBackfill($params: ReexecutionParams!) {
+      reexecutePartitionBackfill(reexecutionParams: $params) {
+        __typename
+        ... on LaunchBackfillSuccess { backfillId }
+        ... on InvalidStepError { invalidStepKey }
+        ... on RunConfigValidationInvalid { errors { message } }
+        ... on Error { message }
+      }
+    }
+    """
+    params = {
+        "parentRunId": backfill_id,
+        "strategy": "FROM_FAILURE" if from_failure else "ALL_STEPS",
+    }
+    data = gql(mutation, {"params": params}, env=env)
+    result = _unwrap_launch_result(
+        data, "reexecutePartitionBackfill", f"retrying backfill {backfill_id!r}"
+    )
+    if from_failure and not backfill.get("isAssetBackfill"):
+        result["note"] = (
+            "Job backfill: only partitions whose last run FAILED are re-run. "
+            "Canceled and never-launched partitions are not; use "
+            "launch_job_with_partitions for them."
+        )
+    return result
+
+
+_REEXECUTION_STATUS_QUERY: Final[str] = """
+query RunStatusForReexecution($runId: ID!) {
+  runOrError(runId: $runId) {
+    __typename
+    ... on Run { status }
+    ... on RunNotFoundError { message }
+    ... on PythonError { message }
+  }
+}
+"""
+
+_FINISHED_RUN_STATUSES: Final[frozenset[str]] = frozenset({"SUCCESS", "FAILURE", "CANCELED"})
+
+_REEXECUTION_STRATEGIES: Final[tuple[str, ...]] = (
+    "FROM_FAILURE",
+    "FROM_ASSET_FAILURE",
+    "ALL_STEPS",
+)
+
+
+def reexecute_run(
+    run_id: str,
+    strategy: str = "FROM_FAILURE",
+    tags: dict[str, str] | None = None,
+    env: str | None = None,
+) -> dict:
+    """Re-execute a finished run, by default only the steps that failed or did not run.
+
+    - run_id: the run to re-execute (from get_runs)
+    - strategy:
+      - 'FROM_FAILURE' (default): re-run the failed steps, the steps
+        downstream of them, and steps that never ran. Outputs of steps that
+        succeeded are reused
+      - 'FROM_ASSET_FAILURE': like FROM_FAILURE, but only the assets that
+        failed inside a multi-asset step
+      - 'ALL_STEPS': re-run the whole run
+    - tags: extra tags for the new run. The original run's tags are kept
+
+    Returns the new run's {run {runId, status}}. The new run has parentRunId
+    set to run_id; see it with get_run_status.
+
+    Use this for a failed run launched by launch_job, materialize_assets, a
+    schedule, or a sensor. For the runs of a backfill, use retry_backfill.
+
+    Refuses, and changes nothing, unless the run is finished (SUCCESS,
+    FAILURE, or CANCELED); Dagster itself would start ALL_STEPS next to a
+    run that is still going. Dagster refuses FROM_FAILURE on a run that
+    succeeded.
+    """
+    normalized = strategy.upper()
+    if normalized not in _REEXECUTION_STRATEGIES:
+        raise ValueError(
+            f"strategy must be one of {', '.join(_REEXECUTION_STRATEGIES)}; got {strategy!r}."
+        )
+    run = gql(_REEXECUTION_STATUS_QUERY, {"runId": run_id}, env=env).get("runOrError") or {}
+    if run.get("__typename") != "Run":
+        return {"run_id": run_id, "message": run.get("message") or f"Run {run_id!r} not found."}
+    if run.get("status") not in _FINISHED_RUN_STATUSES:
+        return {
+            "run_id": run_id,
+            "status": run.get("status"),
+            "message": (
+                f"Run is {run.get('status')}; only a finished run can be re-executed. "
+                "No change was made."
+            ),
+        }
+    mutation = """
+    mutation ReexecuteRun($params: ReexecutionParams!) {
+      launchRunReexecution(reexecutionParams: $params) {
+        __typename
+        ... on LaunchRunSuccess { run { runId status } }
+        ... on InvalidStepError { invalidStepKey }
+        ... on RunConfigValidationInvalid { errors { message } }
+        ... on Error { message }
+      }
+    }
+    """
+    params: dict[str, Any] = {
+        "parentRunId": run_id,
+        "strategy": normalized,
+        "useParentRunTags": True,
+    }
+    if tags:
+        params["extraTags"] = _tag_inputs(tags)
+    data = gql(mutation, {"params": params}, env=env)
+    return _unwrap_launch_result(data, "launchRunReexecution", f"re-executing run {run_id!r}")
+
+
 # ── Write tools (only registered when DAGSTER_READ_ONLY=false) ────────────────
 
 if not READ_ONLY:
@@ -3308,6 +5239,10 @@ if not READ_ONLY:
     mcp.tool()(stop_schedule)
     mcp.tool()(start_sensor)
     mcp.tool()(stop_sensor)
+    mcp.tool()(cancel_backfill)
+    mcp.tool()(resume_backfill)
+    mcp.tool()(retry_backfill)
+    mcp.tool()(reexecute_run)
 
 
 def main():
